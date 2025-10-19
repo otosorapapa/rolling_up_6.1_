@@ -1,0 +1,114 @@
+colors:
+  primary:
+    value: "#0B1F3B"
+    usage: "主要アクション、ヘッダー、強調テキストの基調色。"
+  secondary:
+    value: "#334155"
+    usage: "補助テキスト、境界線、非アクティブ状態。"
+  accent:
+    value: "#0EA5E9"
+    emphasis: "#075985"
+    soft: "#7DD3FC"
+    usage: "リンク、グラフの強調ライン、操作中のインジケータ。"
+  background:
+    value: "#F7F8FB"
+    usage: "アプリ全体の背景。余白を活かす淡いグレー。"
+  surface:
+    value: "#FFFFFF"
+    usage: "カードやモーダルなど、主要なコンテナの背景。"
+  surface_alt:
+    value: "#EEF2F7"
+    usage: "テーブルヘッダーやハイライトされた面の背景。"
+  text:
+    value: "#0B1220"
+    usage: "本文テキストの基本色。"
+  muted:
+    value: "#475569"
+    usage: "キャプションや補足情報の色。"
+  border:
+    value: "#CBD5E1"
+    strong: "#94A3B8"
+    usage: "カード・分割線・入力境界線。"
+  success:
+    value: "#10B981"
+    usage: "増加トレンド、成功メッセージ。"
+  warning:
+    base: "#F59E0B"
+    value: "#F59E0B"
+    usage: "注意喚起。彩度を抑え視認性と落ち着きを両立。"
+  error:
+    value: "#EF4444"
+    usage: "エラー、在庫過剰など緊急性の高い通知。"
+
+typography:
+  body:
+    font_family:
+      - "Inter"
+      - "Source Sans 3"
+      - "Noto Sans JP"
+      - "Hiragino Kaku Gothic ProN"
+      - "Meiryo"
+      - "sans-serif"
+    size_px:
+      min: 14
+      base: 15
+      max: 16
+    line_height: 1.5
+    usage: "本文・表・一般UIラベル。"
+  heading:
+    font_family:
+      - "Inter"
+      - "Source Sans 3"
+      - "Noto Sans JP"
+      - "sans-serif"
+    size_px:
+      min: 22
+      max: 28
+    weight: 600
+    line_height: 1.35
+    usage: "KPIカードタイトル、セクション見出し。"
+  numeric:
+    font_family:
+      - "Roboto Mono"
+      - "Source Code Pro"
+      - "Noto Sans Mono CJK JP"
+      - "monospace"
+    usage: "数値KPI、テーブルの数値列。桁揃えを重視。"
+
+layout:
+  grid:
+    columns: 12
+    guidance: "st.columns([3,1])など比率指定で主従を明確化。"
+  spacing:
+    unit_px: 8
+    scale: [4, 8, 16, 24, 32, 40]
+    usage: "余白は8pxグリッドに沿って設定。"
+  card:
+    radius_px:
+      min: 8
+      base: 10
+      max: 12
+    shadow: "0 12px 24px rgba(11,31,59,0.08)"
+    padding_px: 24
+    usage: "KPIカードやチャートのコンテナ。"
+
+components:
+  kpi_card:
+    base_component: "st.metric"
+    usage: "数値・矢印・前期比を一体表示。delta_colorで上下動を明確化。"
+    tokens:
+      positive: success
+      negative: error
+  tabs:
+    base_component: "st.tabs"
+    items: ["売上", "粗利", "在庫", "資金"]
+    usage: "主要カテゴリの切替。4タブ構成を原則とする。"
+  segment_control:
+    base_component: ["st.radio", "st.selectbox"]
+    usage: "期間・店舗などセグメント切替。ラベルは簡潔に。"
+  toggle:
+    base_component: "st.toggle"
+    usage: "オプションのオン/オフ。補足説明で誤操作防止。"
+  tooltip:
+    base_component: "st.help"
+    usage: "アイコンに補足説明を付与し、情報を圧縮。"

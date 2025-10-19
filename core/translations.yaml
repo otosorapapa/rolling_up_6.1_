@@ -1,0 +1,113 @@
+languages:
+  - ja
+  - en
+
+language_names:
+  ja:
+    ja: 日本語
+    en: Japanese
+  en:
+    ja: 英語
+    en: English
+
+header:
+  title:
+    ja: "売上年計（12カ月移動累計）ダッシュボード"
+    en: "Rolling 12-Month Total Sales Dashboard"
+  eyebrow:
+    ja: "グロースインテリジェンス・ワークスペース"
+    en: "Growth Intelligence Workspace"
+  description:
+    ja: "12カ月移動累計で成長ドライバーとリスクを直感的に把握し、次の一手を素早く導きます。"
+    en: "Understand growth drivers and risks through a rolling 12-month view and decide the next action quickly."
+  actions:
+    primary:
+      label:
+        ja: "サンプルデータで試す"
+        en: "Try with sample data"
+      description:
+        ja: "テンプレートとデモデータですぐにダッシュボードを体験"
+        en: "Preview the dashboard instantly with demo data templates."
+      href:
+        ja: "?nav=import"
+        en: "?nav=import"
+    secondary:
+      label:
+        ja: "データ取込ガイドを見る"
+        en: "Open data import guide"
+      description:
+        ja: "CSV/Excelの整形とテンプレートのポイントを確認"
+        en: "Review CSV/Excel preparation tips and templates."
+      href:
+        ja: "?nav=help"
+        en: "?nav=help"
+    note:
+      ja: "ダッシュボードの主要ワークフローをこの1画面に集約しました。"
+      en: "All essential workflows are curated on this single screen."
+  stats:
+    coverage:
+      value:
+        ja: "12ヶ月"
+        en: "12 months"
+      label:
+        ja: "ローリング期間"
+        en: "Rolling window"
+    refresh:
+      value:
+        ja: "月次更新"
+        en: "Monthly"
+      label:
+        ja: "更新頻度"
+        en: "Refresh cadence"
+    ai:
+      value:
+        ja: "AIサマリー"
+        en: "AI Summary"
+      label:
+        ja: "分析モード"
+        en: "Analysis mode"
+  highlights:
+    trend:
+      title:
+        ja: "勢いを一目で把握"
+        en: "Spot momentum instantly"
+      description:
+        ja: "直近12カ月の推移から伸びと減速の兆しを見抜きます。"
+        en: "Reveal acceleration and slowdowns across the latest 12-month trend."
+    copilot:
+      title:
+        ja: "AIが要点を要約"
+        en: "AI distills the signal"
+      description:
+        ja: "コパイロットがKPIの変化要因や注目SKUを短時間で提案します。"
+        en: "Copilot surfaces KPI drivers and key SKUs in seconds."
+    workflow:
+      title:
+        ja: "次のアクションを導く"
+        en: "Guide the next action"
+      description:
+        ja: "ランキング・比較・異常検知まで一気通貫で深掘りできます。"
+        en: "Move seamlessly from rankings to comparisons and anomaly scouting."
+  elegant_toggle:
+    label:
+      ja: "品格UI"
+      en: "Elegant UI"
+    help:
+      ja: "上品で読みやすい配色・余白・タイポグラフィを適用"
+      en: "Apply refined colors, spacing, and typography for a polished reading experience."
+  dark_mode:
+    label:
+      ja: "ダークモード"
+      en: "Dark mode"
+    help:
+      ja: "長時間の閲覧向けに暗色テーマへ切り替えます"
+      en: "Switch to a low-light navy palette for extended analysis sessions."
+  language_selector:
+    label:
+      ja: "言語"
+      en: "Language"
+
+sidebar:
+  navigation_title:
+    ja: "ナビゲーション"
+    en: "Navigation"
