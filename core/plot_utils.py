@@ -5,10 +5,37 @@ from typing import Any, Iterable
 import inspect
 from pathlib import Path
 
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import streamlit as st
+try:  # pragma: no cover - exercised in import-time error handling
+    import pandas as pd
+except ModuleNotFoundError as exc:  # pragma: no cover - depends on environment
+    raise ImportError(
+        "The Plot utilities require the 'pandas' package. "
+        "Please ensure it is installed (e.g. `pip install pandas`)."
+    ) from exc
+
+try:  # pragma: no cover - exercised in import-time error handling
+    import numpy as np
+except ModuleNotFoundError as exc:  # pragma: no cover - depends on environment
+    raise ImportError(
+        "The Plot utilities require the 'numpy' package. "
+        "Please ensure it is installed (e.g. `pip install numpy`)."
+    ) from exc
+
+try:  # pragma: no cover - exercised in import-time error handling
+    import plotly.graph_objects as go
+except ModuleNotFoundError as exc:  # pragma: no cover - depends on environment
+    raise ImportError(
+        "Plot rendering requires the 'plotly' package. "
+        "Install it with `pip install plotly` to continue."
+    ) from exc
+
+try:  # pragma: no cover - exercised in import-time error handling
+    import streamlit as st
+except ModuleNotFoundError as exc:  # pragma: no cover - depends on environment
+    raise ImportError(
+        "Streamlit is required for the interactive visualisations. "
+        "Install it with `pip install streamlit`."
+    ) from exc
 
 _LAZY_FLAG_PREFIX = "_lazy_loaded::"
 
