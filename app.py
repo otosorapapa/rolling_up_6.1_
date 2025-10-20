@@ -7942,6 +7942,8 @@ PENDING_NAV_PAGE_KEY = "_pending_nav_page"
 NAV_PRIMARY_STATE_KEY = "nav_primary"
 PENDING_NAV_PRIMARY_KEY = "_pending_nav_primary"
 PENDING_NAV_SUB_PREFIX = "_pending_nav_sub_"
+COMPARE_PENDING_DETAIL_CODE_KEY = "_compare_pending_detail_code"
+COMPARE_LAST_NAV_QUERY_KEY = "_compare_last_nav_query"
 
 
 def _queue_nav_category(category: Optional[str], *, rerun_on_lock: bool = False) -> None:
@@ -9277,6 +9279,22 @@ if st.session_state.get("tour_active", True) and TOUR_STEPS:
         default_key = NAV_KEYS[0]
 else:
     default_key = NAV_KEYS[0]
+
+query_params = _get_query_params()
+nav_page_param = query_params.get("nav_page", [])
+sku_param = query_params.get("sku", [])
+nav_signature = (
+    nav_page_param[-1] if nav_page_param else None,
+    sku_param[-1] if sku_param else None,
+)
+if nav_page_param:
+    if st.session_state.get(COMPARE_LAST_NAV_QUERY_KEY) != nav_signature:
+        st.session_state[COMPARE_LAST_NAV_QUERY_KEY] = nav_signature
+        target_page = nav_page_param[-1]
+        if target_page in NAV_KEYS:
+            st.session_state[PENDING_NAV_PAGE_KEY] = target_page
+        if sku_param:
+            st.session_state[COMPARE_PENDING_DETAIL_CODE_KEY] = sku_param[-1]
 
 if "nav_page" not in st.session_state:
     set_active_page(default_key)
@@ -12327,11 +12345,68 @@ elif page == "比較ビュー":
     snapshot = latest_yearsum_snapshot(year_df, end_m)
     snapshot["display_name"] = snapshot["product_name"].fillna(snapshot["product_code"])
 
+    template_profile = get_template_config()
+    cogs_ratio = float(template_profile.get("cogs_ratio", 0.0) or 0.0)
+    opex_ratio = float(template_profile.get("opex_ratio", 0.0) or 0.0)
+    gross_ratio = max(0.0, 1.0 - cogs_ratio)
+    operating_ratio = max(0.0, gross_ratio - opex_ratio)
+
+    hierarchy_df = build_product_hierarchy(year_df)
+    if not hierarchy_df.empty:
+        snapshot = snapshot.merge(
+            hierarchy_df,
+            on="product_code",
+            how="left",
+            suffixes=("", "_hier"),
+        )
+        for col in ("product_name", "department", "category"):
+            hier_col = f"{col}_hier"
+            if hier_col in snapshot.columns:
+                if col in snapshot.columns:
+                    snapshot[col] = snapshot[col].fillna(snapshot[hier_col])
+                else:
+                    snapshot[col] = snapshot[hier_col]
+                snapshot = snapshot.drop(columns=[hier_col])
+    snapshot["department"] = snapshot.get("department", "その他").fillna("その他")
+    snapshot["category"] = snapshot.get("category", "未分類").fillna("未分類")
+
     search = st.text_input("検索ボックス", "")
     if search:
         snapshot = snapshot[
             snapshot["display_name"].str.contains(search, case=False, na=False)
         ]
+
+    if len(snapshot) > 30:
+        max_n = min(100, len(snapshot))
+        default_top = int(st.session_state.get("compare_top_n", 30))
+        default_top = max(10, min(default_top, max_n))
+        top_n = st.slider(
+            "上位N件を表示",
+            min_value=10,
+            max_value=max_n,
+            value=default_top,
+            step=5,
+            help="データが多い場合は上位N件に絞り込んで可視化します。",
+        )
+        st.session_state["compare_top_n"] = top_n
+        snapshot = snapshot.nlargest(top_n, "year_sum")
+
+    if "category" in snapshot.columns and not snapshot.empty:
+        category_options = sorted(snapshot["category"].dropna().unique().tolist())
+        default_categories = st.session_state.get(
+            "compare_categories", category_options
+        )
+        default_categories = [
+            cat for cat in default_categories if cat in category_options
+        ] or category_options
+        selected_categories = st.multiselect(
+            "カテゴリフィルター",
+            category_options,
+            default=default_categories,
+            help="特定カテゴリの商品だけに絞り込みます。",
+        )
+        st.session_state["compare_categories"] = selected_categories
+        snapshot = snapshot[snapshot["category"].isin(selected_categories)]
 
     if snapshot.empty:
         st.info("該当するSKUがありません。検索条件を見直してください。")
@@ -12348,6 +12423,46 @@ elif page == "比較ビュー":
         )
     )
     high0 = int(band_params_initial.get("high_amount", max_amount))
+
+    month_values = (
+        sorted(pd.to_datetime(year_df["month"].unique()))
+        if "month" in year_df.columns
+        else []
+    )
+    month_labels = [m.strftime("%Y-%m") for m in month_values]
+    month_lookup = dict(zip(month_labels, month_values))
+
+    metric_catalog: Dict[str, Dict[str, object]] = {
+        "year_sum": {
+            "label": "売上（12カ月累計）",
+            "column": "year_sum",
+            "type": "currency",
+        }
+    }
+    if gross_ratio > 0:
+        metric_catalog["gross_est"] = {
+            "label": "粗利（推計）",
+            "column": "gross_est",
+            "type": "currency",
+        }
+    if operating_ratio > 0:
+        metric_catalog["operating_est"] = {
+            "label": "営業利益（推計）",
+            "column": "operating_est",
+            "type": "currency",
+        }
+    for qty_col in ("quantity_year", "year_qty", "qty_year_sum", "quantity"):
+        if qty_col in year_df.columns:
+            metric_catalog.setdefault(
+                "quantity",
+                {
+                    "label": "数量（12カ月累計）",
+                    "column": qty_col,
+                    "type": "count",
+                },
+            )
+            break
+    metric_options = [(info["label"], key) for key, info in metric_catalog.items()]
 
     st.markdown(
         """
@@ -12379,10 +12494,18 @@ elif page == "比較ビュー":
     )
 
     st.markdown('<div class="chart-toolbar">', unsafe_allow_html=True)
+    period_opts = ["12ヶ月", "24ヶ月", "36ヶ月"]
+    default_period = st.session_state.get("compare_period", "24ヶ月")
     c1, c2, c3, c4, c5 = st.columns([1.2, 1.6, 1.1, 1.0, 0.9])
     with c1:
         period = st.radio(
-            "期間", ["12ヶ月", "24ヶ月", "36ヶ月"], horizontal=True, index=1
+            "期間",
+            period_opts,
+            horizontal=True,
+            index=period_opts.index(default_period)
+            if default_period in period_opts
+            else 1,
+            key="compare_period",
         )
     with c2:
         node_mode = st.radio(
@@ -12399,6 +12522,64 @@ elif page == "比較ビュー":
         op_mode = st.radio("操作", ["パン", "ズーム", "選択"], horizontal=True, index=0)
     with c5:
         peak_on = st.checkbox("ピーク表示", value=False)
+
+    metric_keys = list(metric_catalog.keys())
+    default_metric = st.session_state.get("compare_metric", metric_keys[0])
+    baseline_options = ["実数値", "指数(初期=100)", "前年比伸び率"]
+    default_baseline = st.session_state.get("compare_baseline", baseline_options[0])
+
+    m1, m2, m3 = st.columns([1.5, 1.2, 2.6])
+    with m1:
+        metric_key = st.selectbox(
+            "基準指標",
+            metric_keys,
+            index=metric_keys.index(default_metric)
+            if default_metric in metric_keys
+            else 0,
+            format_func=lambda k: str(metric_catalog[k]["label"]),
+        )
+        st.session_state["compare_metric"] = metric_key
+    with m2:
+        baseline_mode = st.selectbox(
+            "基準補正",
+            baseline_options,
+            index=baseline_options.index(default_baseline)
+            if default_baseline in baseline_options
+            else 0,
+        )
+        st.session_state["compare_baseline"] = baseline_mode
+    with m3:
+        if month_labels:
+            range_state = st.session_state.get("compare_period_range")
+            if (
+                isinstance(range_state, (list, tuple))
+                and len(range_state) == 2
+                and range_state[0] in month_labels
+                and range_state[1] in month_labels
+            ):
+                default_range = (range_state[0], range_state[1])
+            else:
+                months_back = {"12ヶ月": 12, "24ヶ月": 24, "36ヶ月": 36}.get(
+                    period, 24
+                )
+                end_label = month_labels[-1]
+                start_idx = max(0, len(month_labels) - months_back)
+                start_label = month_labels[start_idx]
+                default_range = (start_label, end_label)
+            range_labels = st.select_slider(
+                "期間範囲",
+                options=month_labels,
+                value=default_range,
+                format_func=lambda v: v,
+                help="比較に用いる期間を指定します。",
+            )
+            st.session_state["compare_period_range"] = range_labels
+        else:
+            range_labels = (None, None)
+
+    range_start_label, range_end_label = range_labels
+    range_start_dt = month_lookup.get(range_start_label) if range_start_label else None
+    range_end_dt = month_lookup.get(range_end_label) if range_end_label else None
 
     c6, c7, c8 = st.columns([2.0, 1.9, 1.6])
     with c6:
@@ -12534,9 +12715,23 @@ elif page == "比較ビュー":
         label_max = st.slider("ラベル最大件数", 5, 20, 12)
     with c12:
         alternate_side = st.checkbox("ラベル左右交互配置", value=True)
+    current_metric_type = str(metric_catalog.get(metric_key, {}).get("type", "currency"))
     c13, c14, c15, c16, c17 = st.columns([1.0, 1.4, 1.2, 1.2, 1.2])
     with c13:
-        unit = st.radio("単位", ["円", "千円", "百万円"], horizontal=True, index=1)
+        if current_metric_type == "currency" and baseline_mode == "実数値":
+            unit_default = st.session_state.get("compare_unit", "千円")
+            unit = st.radio(
+                "単位",
+                ["円", "千円", "百万円"],
+                horizontal=True,
+                index=["円", "千円", "百万円"].index(unit_default)
+                if unit_default in ["円", "千円", "百万円"]
+                else 1,
+                key="compare_unit",
+            )
+        else:
+            unit = st.session_state.get("compare_unit", "千円")
+            st.caption("単位は基準補正に合わせて自動設定されます。")
     with c14:
         n_win = st.slider(
             "傾きウィンドウ（月）",
@@ -12653,28 +12848,226 @@ elif page == "比較ビュー":
     codes_from_band = set(codes)
     target_codes = list(codes_from_band & codes_by_slope & codes_by_shape)
 
-    scale = {"円": 1, "千円": 1_000, "百万円": 1_000_000}[unit]
-    snapshot_disp = snapshot.copy()
-    snapshot_disp["year_sum_disp"] = snapshot_disp["year_sum"] / scale
-    hist_fig = px.histogram(snapshot_disp, x="year_sum_disp")
-    hist_fig.update_xaxes(title_text=f"年計（{unit}）")
 
-    df_long, _ = get_yearly_series(year_df, target_codes)
+    metric_info = metric_catalog.get(metric_key, metric_catalog["year_sum"])
+    metric_type = str(metric_info.get("type", "currency"))
+    metric_label = str(metric_info.get("label", metric_key))
+
+    pinned_codes_state = st.session_state.setdefault("compare_pinned_codes", [])
+    available_codes_set = set(year_df["product_code"].unique())
+    pinned_codes = [code for code in pinned_codes_state if code in available_codes_set]
+    # Preserve the incoming order and ensure pinned items are appended without sorting
+    seen: set[str] = set()
+    ordered_targets: List[str] = []
+    for code in target_codes:
+        if code not in seen:
+            seen.add(code)
+            ordered_targets.append(code)
+    for code in pinned_codes:
+        if code not in seen:
+            seen.add(code)
+            ordered_targets.append(code)
+    target_codes = ordered_targets
+    if not target_codes:
+        st.info("SKUを選択してください。")
+        st.stop()
+
+    if metric_type == "currency" and baseline_mode == "実数値":
+        unit_scale = UNIT_MAP.get(unit, 1)
+        unit_label_chart = unit
+        value_precision = 0
+        delta_formatter = lambda v: "—" if pd.isna(v) else f"{v / unit_scale:+,.0f} {unit}"
+        value_formatter = (
+            lambda v: "—" if pd.isna(v) else f"{v / unit_scale:,.0f} {unit}"
+        )
+    elif baseline_mode == "前年比伸び率":
+        unit_scale = 1
+        unit_label_chart = "%"
+        value_precision = 1
+        delta_formatter = lambda v: "—" if pd.isna(v) else f"{v:+.1f} pt"
+        value_formatter = lambda v: "—" if pd.isna(v) else f"{v:.1f} %"
+    elif baseline_mode == "指数(初期=100)":
+        unit_scale = 1
+        unit_label_chart = "指数"
+        value_precision = 1
+        delta_formatter = lambda v: "—" if pd.isna(v) else f"{v:+.1f} pt"
+        value_formatter = lambda v: "—" if pd.isna(v) else f"{v:.1f}"
+    else:
+        unit_scale = 1
+        unit_label_chart = str(metric_info.get("unit_label", "個"))
+        value_precision = 0
+        delta_formatter = lambda v: "—" if pd.isna(v) else f"{v:+,.0f} {unit_label_chart}"
+        value_formatter = (
+            lambda v: "—" if pd.isna(v) else f"{v:,.0f} {unit_label_chart}"
+        )
+
+    yoy_formatter = lambda v: "—" if pd.isna(v) else f"{v * 100:+.1f}%"
+
+    year_df_metric = year_df.copy()
+    if gross_ratio > 0:
+        year_df_metric["gross_est"] = year_df_metric["year_sum"] * gross_ratio
+    if operating_ratio > 0:
+        year_df_metric["operating_est"] = year_df_metric["year_sum"] * operating_ratio
+    if "quantity" in metric_catalog:
+        qty_col = str(metric_catalog["quantity"].get("column", ""))
+        if qty_col and qty_col not in year_df_metric.columns:
+            year_df_metric[qty_col] = np.nan
+
+    df_long, _ = get_yearly_series(year_df_metric, target_codes)
+    if df_long.empty:
+        st.info("対象期間のデータがありません。期間やフィルターを調整してください。")
+        st.stop()
     df_long["month"] = pd.to_datetime(df_long["month"])
     df_long["display_name"] = df_long["product_name"].fillna(df_long["product_code"])
+    if range_start_dt is not None:
+        df_long = df_long[df_long["month"] >= range_start_dt]
+    if range_end_dt is not None:
+        df_long = df_long[df_long["month"] <= range_end_dt]
+    if df_long.empty:
+        st.info("期間に該当するデータがありません。範囲を調整してください。")
+        st.stop()
 
-    main_codes = target_codes
-    max_lines = 30
-    if len(main_codes) > max_lines:
-        top_order = (
-            snapshot[snapshot["product_code"].isin(main_codes)]
-            .sort_values("year_sum", ascending=False)["product_code"]
-            .tolist()
+    metric_column = str(metric_info.get("column", "year_sum"))
+    if metric_column not in df_long.columns:
+        df_long[metric_column] = np.nan
+    df_long = df_long.sort_values(["product_code", "month"])
+    df_long["metric_value_raw"] = df_long[metric_column].astype(float)
+
+    def _auto_resample(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+        if df.empty:
+            return df
+        unique_dates = np.sort(df["month"].unique())
+        if len(unique_dates) < 2:
+            return df
+        span_days = (unique_dates[-1] - unique_dates[0]).days
+        if span_days <= 90:
+            target = "D"
+        elif span_days <= 540:
+            target = "W"
+        else:
+            target = "M"
+        diffs = np.diff(unique_dates).astype("timedelta64[D]").astype(int)
+        median_days = np.median(diffs) if len(diffs) else 30
+        if median_days <= 1:
+            base = "D"
+        elif median_days <= 7:
+            base = "W"
+        else:
+            base = "M"
+        freq_order = {"D": 1, "W": 7, "M": 30}
+        if freq_order[target] <= freq_order[base]:
+            return df
+        frames: List[pd.DataFrame] = []
+        for code, group in df.groupby("product_code"):
+            g = group.sort_values("month").set_index("month")
+            numeric_cols = g.select_dtypes(include=[np.number]).columns
+            resampled = g[numeric_cols].resample(target).last()
+            resampled = resampled.reset_index()
+            resampled["product_code"] = code
+            resampled["product_name"] = group["product_name"].iloc[-1]
+            resampled["display_name"] = group["display_name"].iloc[-1]
+            frames.append(resampled)
+        return pd.concat(frames, ignore_index=True)
+
+    df_chart = _auto_resample(df_long, "metric_value_raw")
+    df_chart = df_chart.sort_values(["product_code", "month"])
+    df_chart["metric_delta"] = df_chart.groupby("product_code")["metric_value_raw"].diff()
+    df_chart["metric_yoy"] = df_chart.groupby("product_code")["metric_value_raw"].pct_change(12)
+
+    df_chart["display_value"] = df_chart["metric_value_raw"]
+    df_chart["display_delta"] = df_chart["metric_delta"]
+    df_chart["display_yoy"] = df_chart["metric_yoy"]
+
+    if baseline_mode == "指数(初期=100)":
+        def _normalise(group: pd.DataFrame) -> pd.DataFrame:
+            base_series = group["metric_value_raw"].dropna()
+            base_val = base_series.iloc[0] if not base_series.empty else np.nan
+            if pd.isna(base_val) or base_val == 0:
+                group["display_value"] = np.nan
+            else:
+                group["display_value"] = group["metric_value_raw"] / base_val * 100
+            group["display_delta"] = group["display_value"].diff()
+            return group
+
+        df_chart = df_chart.groupby("product_code", group_keys=False).apply(_normalise)
+    elif baseline_mode == "前年比伸び率":
+        df_chart["display_value"] = df_chart["metric_yoy"] * 100
+        df_chart["display_delta"] = df_chart.groupby("product_code")["metric_yoy"].diff() * 100
+        df_chart["display_yoy"] = df_chart["metric_yoy"]
+    else:
+        df_chart["display_delta"] = df_chart["metric_delta"]
+
+    df_chart["delta"] = df_chart["display_delta"]
+    df_chart["yoy"] = df_chart["display_yoy"]
+
+    latest_metric = (
+        df_chart.sort_values("month")
+        .groupby("product_code")
+        .tail(1)
+        .merge(
+            snapshot[["product_code", "display_name", "category"]],
+            on="product_code",
+            how="left",
         )
-        main_codes = top_order[:max_lines]
+    )
 
-    df_main = df_long[df_long["product_code"].isin(main_codes)]
+    hist_data = latest_metric.copy()
+    if metric_type == "currency" and baseline_mode == "実数値":
+        hist_data["metric_display"] = hist_data["display_value"] / unit_scale
+    else:
+        hist_data["metric_display"] = hist_data["display_value"]
+    hist_fig = px.histogram(hist_data, x="metric_display")
+    hist_fig.update_xaxes(title_text=f"{metric_label}（{unit_label_chart}）")
 
+    max_lines = 30
+    ordered_codes = (
+        latest_metric.sort_values("display_value", ascending=False)["product_code"].tolist()
+    )
+    preferred_order = pinned_codes + [code for code in ordered_codes if code not in pinned_codes]
+    main_codes = preferred_order[:max_lines] if preferred_order else target_codes
+
+    code_to_label = {
+        row.product_code: row.display_name for row in latest_metric.itertuples()
+    }
+
+    with st.expander("表示SKUとピン留め", expanded=False):
+        pinned_selection = st.multiselect(
+            "ピン留めSKU",
+            options=sorted(code_to_label.keys()),
+            default=pinned_codes,
+            format_func=lambda code: f"{code_to_label.get(code, code)} ({code})",
+        )
+        st.session_state["compare_pinned_codes"] = pinned_selection
+        pinned_codes = pinned_selection
+        available_for_display = [code for code in preferred_order if code in code_to_label]
+        default_visible = st.session_state.get("compare_visible_codes", main_codes)
+        default_visible = [code for code in default_visible if code in available_for_display]
+        if not default_visible:
+            default_visible = available_for_display[: min(len(available_for_display), 12)]
+        visible_codes = st.multiselect(
+            "表示SKU",
+            options=available_for_display,
+            default=default_visible,
+            format_func=lambda code: f"{code_to_label.get(code, code)} ({code})",
+        )
+    visible_set = set(visible_codes) | set(pinned_codes)
+    ordered_visible = [code for code in preferred_order if code in visible_set]
+    for code in visible_set:
+        if code not in ordered_visible:
+            ordered_visible.append(code)
+    visible_codes = ordered_visible
+    if not visible_codes:
+        st.info("表示するSKUを選択してください。")
+        st.stop()
+    st.session_state["compare_visible_codes"] = visible_codes
+
+    df_chart = df_chart[df_chart["product_code"].isin(visible_codes)]
+    latest_metric = latest_metric[latest_metric["product_code"].isin(visible_codes)]
+    main_codes = visible_codes
+
+    highlight_names = {
+        code_to_label.get(code, code) for code in pinned_codes if code in code_to_label
+    }
     with ai_summary_container:
         ai_on = st.toggle(
             "AIサマリー",
@@ -12683,25 +13076,31 @@ elif page == "比較ビュー":
             help="要約・コメント・自動説明を表示（オンデマンド計算）",
         )
         with st.expander("AIサマリー", expanded=ai_on):
-            if ai_on and not df_main.empty:
+            if ai_on and not df_chart.empty:
                 pos = len(codes_steep)
                 mtn = len(codes_mtn & set(main_codes))
                 val = len(codes_val & set(main_codes))
-                explain = _ai_explain(
-                    {
-                        "対象SKU数": len(main_codes),
-                        "中央値(年計)": float(
-                            snapshot_disp.loc[
-                                snapshot_disp["product_code"].isin(main_codes),
-                                "year_sum_disp",
-                            ].median()
-                        ),
-                        "急勾配数": pos,
-                        "山数": mtn,
-                        "谷数": val,
-                    }
+                median_val = (
+                    float(latest_metric["display_value"].median())
+                    if not latest_metric.empty
+                    else 0.0
                 )
+                if metric_type == "currency" and baseline_mode == "実数値":
+                    median_val_display = median_val / unit_scale
+                else:
+                    median_val_display = median_val
+                explain_payload = {
+                    "対象SKU数": int(len(main_codes)),
+                    f"中央値({metric_label})": float(median_val_display),
+                    "急勾配数": int(pos),
+                    "山数": int(mtn),
+                    "谷数": int(val),
+                }
+                explain = _ai_explain(explain_payload)
+                median_text = value_formatter(median_val)
                 st.info(f"**AI比較コメント**：{explain}")
+                if median_text != "—":
+                    st.caption(f"中央値({metric_label})：{median_text}")
 
     tb_common = dict(
         period=period,
@@ -12709,7 +13108,7 @@ elif page == "比較ビュー":
         hover_mode=hover_mode,
         op_mode=op_mode,
         peak_on=peak_on,
-        unit=unit,
+        unit=unit if current_metric_type == "currency" and baseline_mode == "実数値" else unit_label_chart,
         enable_avoid=enable_label_avoid,
         gap_px=label_gap_px,
         max_labels=label_max,
@@ -12721,13 +13120,29 @@ elif page == "比較ビュー":
         forecast_k=2.0,
         forecast_robust=False,
         anomaly="OFF",
+        unit_scale=unit_scale,
+        unit_label=unit_label_chart,
+        metric_label=metric_label,
+        value_precision=value_precision,
+        yoy_formatter=yoy_formatter,
+        delta_formatter=delta_formatter,
+        show_avg_band=True,
+    )
+    band_for_chart = (
+        (low, high)
+        if metric_key == "year_sum"
+        and current_metric_type == "currency"
+        and baseline_mode == "実数値"
+        else None
     )
     fig = build_chart_card(
-        df_main,
-        selected_codes=None,
+        df_chart,
+        selected_codes=visible_codes,
         multi_mode=True,
         tb=tb_common,
-        band_range=(low, high),
+        band_range=band_for_chart,
+        value_column="display_value",
+        highlight_codes=highlight_names,
     )
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</section>", unsafe_allow_html=True)
@@ -12747,9 +13162,40 @@ zスコア：全SKUの傾き分布に対する標準化。|z|≥1.5で急勾配�
 """
     )
 
-    snap_export = snapshot[snapshot["product_code"].isin(main_codes)].copy()
-    snap_export[f"year_sum_{unit}"] = snap_export["year_sum"] / scale
-    snap_export = snap_export.drop(columns=["year_sum"])
+    latest_export = latest_metric.copy()
+    if "category" not in latest_export.columns:
+        latest_export["category"] = ""
+    if "metric_value_raw" not in latest_export.columns:
+        latest_export["metric_value_raw"] = latest_export.get("display_value", np.nan)
+    display_col_label = f"{metric_label}（{unit_label_chart}）"
+    raw_col_label = f"{metric_label}(raw)"
+    if baseline_mode in {"前年比伸び率", "指数(初期=100)"}:
+        delta_label = "Δ (pt)"
+    else:
+        delta_label = f"Δ（{unit_label_chart}）"
+    latest_export[display_col_label] = latest_export["display_value"]
+    latest_export[delta_label] = latest_export["display_delta"]
+    if metric_type == "currency" and baseline_mode == "実数値":
+        latest_export[display_col_label] = latest_export[display_col_label] / unit_scale
+        latest_export[delta_label] = latest_export[delta_label] / unit_scale
+    latest_export["YoY(%)"] = latest_export["display_yoy"] * 100
+    export_cols = [
+        "product_code",
+        "display_name",
+        "category",
+        "metric_value_raw",
+        display_col_label,
+        delta_label,
+        "YoY(%)",
+    ]
+    snap_export = latest_export[export_cols].rename(
+        columns={
+            "product_code": "SKUコード",
+            "display_name": "表示名",
+            "category": "カテゴリ",
+            "metric_value_raw": raw_col_label,
+        }
+    )
     csv_band_clicked = st.download_button(
         "CSVエクスポート",
         data=snap_export.to_csv(index=False).encode("utf-8-sig"),
@@ -12790,89 +13236,174 @@ zスコア：全SKUの傾き分布に対する標準化。|z|≥1.5で急勾配�
         )
 
     # ---- Small Multiples ----
-    df_nodes = df_main.iloc[0:0].copy()
-    HALO = "#ffffff" if st.get_option("theme.base") == "dark" else "#222222"
-    SZ = 6
-    dtick = "M1"
-    drag = {"ズーム": "zoom", "パン": "pan", "選択": "select"}[op_mode]
+    df_small = df_chart[df_chart["product_code"].isin(main_codes)].copy()
+    if df_small.empty:
+        st.subheader("スモールマルチプル")
+        st.info("表示するSKUにデータがありません。フィルターを見直してください。")
+    else:
+        df_small["value_display"] = df_small["display_value"].apply(value_formatter)
+        df_small["delta_display"] = df_small["display_delta"].apply(delta_formatter)
+        df_small["yoy_display"] = df_small["display_yoy"].apply(yoy_formatter)
 
-    st.subheader("スモールマルチプル")
-    share_y = st.checkbox("Y軸共有", value=False)
-    show_keynode_labels = st.checkbox("キーノードラベル表示", value=False)
-    per_page = st.radio("1ページ表示枚数", [8, 12], horizontal=True, index=0)
-    total_pages = max(1, math.ceil(len(main_codes) / per_page))
-    page_idx = st.number_input("ページ", min_value=1, max_value=total_pages, value=1)
-    start = (page_idx - 1) * per_page
-    page_codes = main_codes[start : start + per_page]
-    col_count = 4
-    cols = st.columns(col_count)
-    ymax = (
-        df_long[df_long["product_code"].isin(main_codes)]["year_sum"].max()
-        / UNIT_MAP[unit]
-        if share_y
-        else None
-    )
-    for i, code in enumerate(page_codes):
-        g = df_long[df_long["product_code"] == code]
-        disp = g["display_name"].iloc[0] if not g.empty else code
-        palette = fig.layout.colorway or px.colors.qualitative.Safe
-        fig_s = px.line(
-            g,
-            x="month",
-            y="year_sum",
-            color_discrete_sequence=[palette[i % len(palette)]],
-            custom_data=["display_name"],
+        st.subheader("スモールマルチプル")
+        share_y = st.checkbox("Y軸共有", value=False)
+        per_page = st.radio("1ページ表示枚数", [8, 12], horizontal=True, index=0)
+        total_pages = max(1, math.ceil(len(main_codes) / per_page))
+        page_idx = st.number_input(
+            "ページ", min_value=1, max_value=total_pages, value=1
         )
-        fig_s.update_traces(
-            mode="lines",
-            line=dict(width=1.5),
-            opacity=0.8,
-            showlegend=False,
-            hovertemplate=f"<b>%{{customdata[0]}}</b><br>月：%{{x|%Y-%m}}<br>年計：%{{y:,.0f}} {unit}<extra></extra>",
-        )
-        fig_s.update_xaxes(tickformat="%Y-%m", dtick=dtick, title_text="月（YYYY-MM）")
-        fig_s.update_yaxes(
-            tickformat="~,d",
-            range=[0, ymax] if ymax else None,
-            title_text=f"売上 年計（{unit}）",
-        )
-        fig_s.update_layout(font=dict(family="Noto Sans JP, Meiryo, Arial", size=12))
-        fig_s.update_layout(
-            hoverlabel=dict(
-                bgcolor="rgba(30,30,30,0.92)", font=dict(color="#fff", size=12)
-            )
-        )
-        fig_s.update_layout(dragmode=drag)
-        if hover_mode == "個別":
-            fig_s.update_layout(hovermode="closest")
+        start = (page_idx - 1) * per_page
+        page_codes = main_codes[start : start + per_page]
+        col_count = 4
+        cols = st.columns(col_count)
+
+        if share_y:
+            y_values = df_small["display_value"].dropna()
+            if not y_values.empty:
+                y_min = float(y_values.min())
+                y_max = float(y_values.max())
+                if not np.isfinite(y_min) or not np.isfinite(y_max):
+                    y_range = None
+                else:
+                    if abs(y_max - y_min) < 1e-9:
+                        padding = abs(y_max) * 0.05 or 1.0
+                        y_min -= padding
+                        y_max += padding
+                    y_range = [y_min, y_max]
+            else:
+                y_range = None
         else:
-            fig_s.update_layout(hovermode="x unified", hoverlabel=dict(align="left"))
-        last_val = (
-            g.sort_values("month")["year_sum"].iloc[-1] / UNIT_MAP[unit]
-            if not g.empty
-            else np.nan
-        )
-        with cols[i % col_count]:
-            st.metric(
-                disp, f"{last_val:,.0f} {unit}" if not np.isnan(last_val) else "—"
+            y_range = None
+
+        palette = fig.layout.colorway or px.colors.qualitative.Safe
+
+        def _resolve_label(code: str) -> str:
+            return code_to_label.get(code, code)
+
+        for i, code in enumerate(page_codes):
+            g = df_small[df_small["product_code"] == code].sort_values("month")
+            disp = _resolve_label(code)
+            tick_dates = pd.to_datetime(g["month"].unique())
+            tick_dates = tick_dates.sort_values()
+            if len(tick_dates) >= 2:
+                span_days = (tick_dates[-1] - tick_dates[0]).days
+            else:
+                span_days = 0
+            if span_days <= 90:
+                tickformat = "%m-%d"
+            else:
+                tickformat = "%Y-%m"
+            color = palette[i % len(palette)]
+            fig_s = px.line(
+                g,
+                x="month",
+                y="display_value",
+                color_discrete_sequence=[color],
+                custom_data=[
+                    g["display_name"],
+                    g["value_display"],
+                    g["delta_display"],
+                    g["yoy_display"],
+                    g["product_code"],
+                ],
             )
-            fig_s = apply_elegant_theme(
-                fig_s, theme=st.session_state.get("ui_theme", "light")
+            line_width = 2.8 if disp in highlight_names else 1.6
+            fig_s.update_traces(
+                mode="lines",
+                line=dict(width=line_width),
+                opacity=0.9,
+                showlegend=False,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "日付：%{x|%Y-%m-%d}<br>"
+                    f"{metric_label}：%{{customdata[1]}}<br>"
+                    f"Δ：%{{customdata[2]}}<br>"
+                    f"YoY：%{{customdata[3]}}<extra></extra>"
+                ),
             )
-            fig_s.update_layout(height=225)
-            render_plotly_with_spinner(
-                fig_s, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
+            fig_s.update_xaxes(title_text="日付", tickformat=tickformat)
+            fig_s.update_yaxes(
+                tickformat="~,d",
+                range=y_range,
+                title_text=f"{metric_label}（{unit_label_chart}）",
             )
+            fig_s.update_layout(font=dict(family="Noto Sans JP, Meiryo, Arial", size=12))
+            fig_s.update_layout(
+                hoverlabel=dict(
+                    bgcolor="rgba(30,30,30,0.92)", font=dict(color="#fff", size=12)
+                )
+            )
+            fig_s.update_layout(dragmode={"ズーム": "zoom", "パン": "pan", "選択": "select"}[op_mode])
+            if hover_mode == "個別":
+                fig_s.update_layout(hovermode="closest")
+            else:
+                fig_s.update_layout(hovermode="x unified", hoverlabel=dict(align="left"))
+
+            latest_row = g.tail(1)
+            latest_val = (
+                value_formatter(float(latest_row["display_value"].iloc[0]))
+                if not latest_row.empty
+                else "—"
+            )
+            with cols[i % col_count]:
+                st.metric(disp, latest_val)
+                themed_fig = apply_elegant_theme(
+                    fig_s, theme=st.session_state.get("ui_theme", "light")
+                )
+                themed_fig.update_layout(height=238)
+                render_plotly_with_spinner(
+                    themed_fig, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
+                )
+                action_cols = st.columns([1, 1])
+                with action_cols[0]:
+                    if st.button("詳細へ", key=f"compare_small_detail_{code}"):
+                        st.session_state[COMPARE_PENDING_DETAIL_CODE_KEY] = code
+                        try:
+                            query_proxy = getattr(st, "query_params", None)
+                            if query_proxy is not None:
+                                query_proxy["nav_page"] = "SKU詳細"
+                                query_proxy["sku"] = code
+                            else:
+                                st.experimental_set_query_params(nav_page="SKU詳細", sku=code)
+                        except Exception:
+                            pass
+                        set_active_page("SKU詳細", rerun_on_lock=True)
+                with action_cols[1]:
+                    pin_now = st.checkbox(
+                        "ピン留め",
+                        value=code in pinned_codes,
+                        key=f"compare_small_pin_{code}",
+                    )
+                    if pin_now and code not in pinned_codes:
+                        updated_pins = list(dict.fromkeys(pinned_codes + [code]))
+                        st.session_state["compare_pinned_codes"] = updated_pins
+                    elif not pin_now and code in pinned_codes:
+                        updated_pins = [c for c in pinned_codes if c != code]
+                        st.session_state["compare_pinned_codes"] = updated_pins
+                    if pin_now and code not in st.session_state.get(
+                        "compare_visible_codes", []
+                    ):
+                        current_visible = st.session_state.get("compare_visible_codes", [])
+                        updated_visible = list(
+                            dict.fromkeys(current_visible + [code])
+                        )
+                        st.session_state["compare_visible_codes"] = updated_visible
 
     # 5) SKU詳細
 elif page == "SKU詳細":
     require_data()
     section_header("SKU 詳細", "個別SKUのトレンドとメモを一元管理。", icon="🗂️")
     end_m = sidebar_state.get("detail_end_month") or latest_month
+    pending_compare_code = st.session_state.pop(COMPARE_PENDING_DETAIL_CODE_KEY, None)
     prods = (
         st.session_state.data_year[["product_code", "product_name"]]
         .drop_duplicates()
         .sort_values("product_code")
+    )
+    prods["label"] = (
+        prods["product_code"]
+        + " | "
+        + prods["product_name"].fillna(prods["product_code"])
     )
     mode = st.radio("表示モード", ["単品", "複数比較"], horizontal=True)
     tb = toolbar_sku_detail(multi_mode=(mode == "複数比較"))
@@ -12891,8 +13422,28 @@ elif page == "SKU詳細":
     modal_is_multi = False
 
     if mode == "単品":
+        option_labels = prods["label"].tolist()
+        default_label = option_labels[0] if option_labels else ""
+        if pending_compare_code and option_labels:
+            match_label = next(
+                (
+                    label
+                    for label in option_labels
+                    if label.split(" | ")[0] == pending_compare_code
+                ),
+                None,
+            )
+            if match_label:
+                st.session_state["sku_detail_single_select"] = match_label
+        if (
+            "sku_detail_single_select" not in st.session_state
+            and default_label
+        ):
+            st.session_state["sku_detail_single_select"] = default_label
         prod_label = st.selectbox(
-            "SKU選択", options=prods["product_code"] + " | " + prods["product_name"]
+            "SKU選択",
+            options=option_labels,
+            key="sku_detail_single_select",
         )
         code = prod_label.split(" | ")[0]
         build_chart_card(
