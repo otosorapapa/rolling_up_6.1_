@@ -2,10 +2,37 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+import inspect
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+
+_LAZY_FLAG_PREFIX = "_lazy_loaded::"
+
+
+def _ensure_lazy_ready(key: str, label: str, description: str | None = None) -> bool:
+    state_key = f"{_LAZY_FLAG_PREFIX}{key}"
+    if st.session_state.get(state_key):
+        return True
+    placeholder = st.container()
+    with placeholder:
+        message = f"**{label}** を読み込むと詳細な可視化が表示されます。"
+        if description:
+            message = message + f"\n{description}"
+        st.info(message)
+        if st.button(f"{label}を表示", key=f"lazy_btn_{abs(hash(key)) % 100000}"):
+            st.session_state[state_key] = True
+            st.rerun()
+    return False
+
+
+def ensure_lazy_ready(key: str, label: str, description: str | None = None) -> bool:
+    """Public helper so other modules can reuse the lazy gate."""
+
+    return _ensure_lazy_ready(key, label, description)
 
 from core.design_tokens import get_color, get_font_stack, rgba
 
@@ -362,9 +389,26 @@ def render_plotly_with_spinner(
     spinner_text: str = "グラフを描画中…",
     use_container_width: bool = True,
     config: dict | None = None,
+    lazy: bool = True,
+    lazy_label: str = "グラフ",
+    lazy_description: str | None = None,
+    lazy_key: str | None = None,
     **kwargs: Any,
 ) -> None:
     """Render a Plotly figure with a spinner to highlight processing."""
+
+    if lazy:
+        inferred_key = lazy_key
+        if inferred_key is None:
+            frame = inspect.currentframe()
+            caller = frame.f_back if frame else None
+            if caller:
+                code = caller.f_code
+                inferred_key = f"{Path(code.co_filename).name}:{caller.f_lineno}:{lazy_label}"
+            else:
+                inferred_key = lazy_label
+        if not _ensure_lazy_ready(inferred_key, lazy_label, lazy_description):
+            return
 
     with st.spinner(spinner_text):
         height = kwargs.pop("height", None)

@@ -4,6 +4,7 @@ import json
 import math
 import re
 import textwrap
+import inspect
 from string import Template
 from urllib.parse import urlencode
 from contextlib import contextmanager, nullcontext
@@ -1124,7 +1125,12 @@ from sample_data import (
     load_sample_dataset,
 )
 from core.chart_card import toolbar_sku_detail, build_chart_card
-from core.plot_utils import apply_elegant_theme, padded_range, render_plotly_with_spinner
+from core.plot_utils import (
+    apply_elegant_theme,
+    ensure_lazy_ready,
+    padded_range,
+    render_plotly_with_spinner,
+)
 from core.correlation import (
     corr_table,
     fisher_ci,
@@ -2569,7 +2575,9 @@ if "dark_mode" not in st.session_state:
 if "ui_theme" not in st.session_state:
     st.session_state["ui_theme"] = "light"
 
-with st.container():
+controls_wrapper = st.container()
+with controls_wrapper:
+    st.markdown("<div class='global-controls'>", unsafe_allow_html=True)
     control_left, control_right = st.columns([3, 1])
     with control_left:
         toggle_cols = st.columns(2)
@@ -2607,6 +2615,7 @@ with st.container():
             key="language",
             format_func=lambda code: language_name(code),
         )
+    st.markdown("</div>", unsafe_allow_html=True)
 
 elegant_on = st.session_state.get("elegant_on", True)
 dark_mode = st.session_state.get("dark_mode", False)
@@ -3214,6 +3223,12 @@ if "import_upload_preview" not in st.session_state:
     st.session_state.import_upload_preview = None
 if "import_upload_diagnostics" not in st.session_state:
     st.session_state.import_upload_diagnostics = None
+if "dataset_sources" not in st.session_state:
+    st.session_state.dataset_sources: Dict[str, Dict[str, object]] = {}
+if "active_dataset_source" not in st.session_state:
+    st.session_state.active_dataset_source = None
+if "sample_bootstrapped" not in st.session_state:
+    st.session_state.sample_bootstrapped = False
 
 # track user interactions and global filters
 if "click_log" not in st.session_state:
@@ -3228,6 +3243,69 @@ UNIT_MAP = {"円": 1, "千円": 1_000, "百万円": 1_000_000}
 def log_click(name: str):
     """Increment click count for command bar actions."""
     st.session_state.click_log[name] = st.session_state.click_log.get(name, 0) + 1
+
+
+def register_dataset_source(
+    source_key: str,
+    *,
+    label: str,
+    description: str,
+    monthly: pd.DataFrame,
+    yearly: pd.DataFrame,
+) -> None:
+    """Persist processed datasets for quick switching between sources."""
+
+    st.session_state.dataset_sources[source_key] = {
+        "label": label,
+        "description": description,
+        "monthly": monthly.copy(),
+        "yearly": yearly.copy(),
+        "updated_at": datetime.now().isoformat(),
+    }
+
+
+def activate_dataset_source(source_key: str, *, silent: bool = False) -> None:
+    """Replace active tables with the stored dataset for ``source_key``."""
+
+    entry = st.session_state.dataset_sources.get(source_key)
+    if not entry:
+        return
+    st.session_state.data_monthly = entry["monthly"].copy()
+    st.session_state.data_year = entry["yearly"].copy()
+    st.session_state.active_dataset_source = source_key
+    if not silent:
+        st.session_state.sample_data_notice = True
+        label = entry.get("label", source_key)
+        st.session_state.sample_data_message = (
+            f"{label} を読み込みました。全ページでこのデータセットが利用されます。"
+        )
+
+
+def ensure_sample_dataset_bootstrapped() -> None:
+    """Load the bundled sample dataset on first launch for instant demos."""
+
+    if (
+        st.session_state.data_year is not None
+        and st.session_state.data_monthly is not None
+    ):
+        return
+    if st.session_state.get("sample_bootstrapped"):
+        active = st.session_state.get("active_dataset_source")
+        if active and active in st.session_state.dataset_sources:
+            activate_dataset_source(active, silent=True)
+        return
+
+    sample_long = load_sample_dataset()
+    normalized, year_df = process_long_dataframe(sample_long)
+    register_dataset_source(
+        "sample",
+        label="サンプルデータ",
+        description="初期セットアップ用の合成データセットです。",
+        monthly=normalized,
+        yearly=year_df,
+    )
+    st.session_state.sample_bootstrapped = True
+    activate_dataset_source("sample")
 
 
 def get_active_template_key() -> str:
@@ -4481,6 +4559,9 @@ def ingest_wide_dataframe(
     return process_long_dataframe(long_df)
 
 
+ensure_sample_dataset_bootstrapped()
+
+
 def format_amount(val: Optional[float], unit: str) -> str:
     """Format a numeric value according to currency unit."""
     if val is None or (isinstance(val, float) and math.isnan(val)):
@@ -4553,6 +4634,30 @@ def render_dataset_metric_cards(
         help_text="年計基準のKPIをカード形式で表示します。ダッシュボードに移動する前に全体感を把握できます。",
     )
     render_metric_cards(cards, columns=min(4, len(cards)))
+
+
+def lazy_dataframe(
+    df: pd.DataFrame,
+    *,
+    label: str = "テーブル",
+    key: str | None = None,
+    description: str | None = None,
+    **kwargs: Any,
+) -> None:
+    """Render a dataframe with lazy loading to defer heavy tables."""
+
+    gate_key = key
+    if gate_key is None:
+        frame = inspect.currentframe()
+        caller = frame.f_back if frame else None
+        if caller:
+            code = caller.f_code
+            gate_key = f"{Path(code.co_filename).name}:{caller.f_lineno}:{label}"
+        else:
+            gate_key = label
+    if not ensure_lazy_ready(gate_key, label, description):
+        return
+    st.dataframe(df, **kwargs)
 
 
 def _detect_column(
@@ -5473,8 +5578,11 @@ def _render_sales_tab(
                 guide="期間や店舗を切り替えてデータを再取得してください。",
             )
         else:
-            st.dataframe(
+            lazy_dataframe(
                 detail_display_df.style.format(detail_formatters),
+                label="売上明細",
+                key="table_sales_detail",
+                description="必要なときだけ詳細行を描画します。",
                 use_container_width=True,
             )
 
@@ -5872,7 +5980,7 @@ def _render_gross_profit_tab(
                 }
             )
 
-            st.dataframe(
+            lazy_dataframe(
                 display_df.style.format(
                     {
                         f"月次粗利({unit})": "{:,.0f}",
@@ -5882,6 +5990,9 @@ def _render_gross_profit_tab(
                         f"前月差({unit})": "{:,.0f}",
                     }
                 ),
+                label="粗利明細",
+                key="table_gross_detail",
+                description="粗利明細は必要なときにのみ描画されます。",
                 use_container_width=True,
             )
 
@@ -6260,7 +6371,7 @@ def _render_inventory_tab(
                     f"前月差({unit})": detail_df["delta"] / unit_scale,
                 }
             )
-            st.dataframe(
+            lazy_dataframe(
                 display_df.style.format(
                     {
                         f"在庫金額({unit})": "{:,.0f}",
@@ -6269,6 +6380,9 @@ def _render_inventory_tab(
                         f"前月差({unit})": "{:,.0f}",
                     }
                 ),
+                label="在庫明細",
+                key="table_inventory_detail",
+                description="在庫テーブルは要求時にのみ描画します。",
                 use_container_width=True,
             )
             csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
@@ -6478,13 +6592,16 @@ def _render_funds_tab(
             display_df = table_df[["item", f"金額({unit})", "構成比(%)"]].rename(
                 columns={"item": "項目"}
             )
-            st.dataframe(
+            lazy_dataframe(
                 display_df.style.format(
                     {
                         f"金額({unit})": "{:,.0f}",
                         "構成比(%)": "{:.1f}%",
                     }
                 ),
+                label="資金繰り計算書",
+                key="table_cash_flow_statement",
+                description="資金繰り表はボタン操作で描画します。",
                 use_container_width=True,
             )
             csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
@@ -7013,60 +7130,57 @@ st.markdown(
     .tour-step-guide{
       display:flex;
       flex-wrap:wrap;
-      gap:0.9rem;
+      gap:var(--space-1);
       margin:0 0 1.2rem;
     }
-    .tour-step-guide__item{
-      display:flex;
-      flex-direction:column;
-      align-items:center;
-      gap:0.45rem;
-      padding:0.75rem 0.9rem;
-      border-radius:14px;
-      border:1px solid var(--border);
-      background:var(--panel);
-      box-shadow:0 12px 26px rgba(11,44,74,0.14);
-      min-width:120px;
-      position:relative;
-      transition:transform .16s ease, box-shadow .16s ease, border-color .16s ease;
-      cursor:pointer;
-      text-decoration:none;
-      color:inherit;
+    .tour-step-guide [data-testid="column"]{
+      flex:1 1 180px;
+      min-width:160px;
     }
-    .tour-step-guide__item:hover{
-      transform:translateY(-3px);
-      box-shadow:0 18px 32px rgba(11,44,74,0.18);
-    }
-    .tour-step-guide__item[data-active="true"]{
-      border-color:rgba(15,76,129,0.55);
-      box-shadow:0 20px 40px rgba(15,76,129,0.22);
-    }
-    .tour-step-guide__item:focus-visible{
-      outline:3px solid rgba(15,76,129,0.35);
-      outline-offset:3px;
-    }
-    .tour-step-guide__icon{
-      width:34px;
-      height:34px;
-      border-radius:50%;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      font-size:1.05rem;
-      background:rgba(15,76,129,0.1);
+    .tour-step-guide [data-testid="stButton"]>button{
+      justify-content:flex-start;
+      gap:0.55rem;
+      border-radius:999px;
+      border:1px solid rgba(${PRIMARY_RGB},0.18);
+      background:rgba(${PRIMARY_RGB},0.08);
       color:var(--accent-strong);
-      box-shadow:0 10px 20px rgba(15,76,129,0.12);
-    }
-    .tour-step-guide__icon svg{
-      width:18px;
-      height:18px;
-    }
-    .tour-step-guide__label{
-      font-size:0.95rem;
       font-weight:700;
+      letter-spacing:.03em;
+      box-shadow:0 12px 24px rgba(${PRIMARY_RGB},0.12);
+    }
+    .tour-step-guide [data-testid="stButton"]>button:hover:not(:disabled){
+      border-color:rgba(${PRIMARY_RGB},0.32);
+      background:rgba(${PRIMARY_RGB},0.12);
+      box-shadow:0 16px 30px rgba(${PRIMARY_RGB},0.18);
+    }
+    .tour-step-guide [data-testid="stButton"]>button:focus-visible{
+      outline:3px solid rgba(${PRIMARY_RGB},0.35);
+      outline-offset:2px;
+    }
+    .tour-step-guide [data-testid="stButton"]>button:disabled{
+      background:${PRIMARY_COLOR};
+      border-color:${PRIMARY_COLOR};
+      color:#ffffff;
+      box-shadow:0 20px 38px rgba(${PRIMARY_RGB},0.25);
+    }
+    .page-short-help{
+      margin:var(--space-2) 0 var(--space-1);
+      padding:0.85rem 1.05rem;
+      border-radius:14px;
+      border:1px solid rgba(${PRIMARY_RGB},0.18);
+      background:color-mix(in srgb, var(--panel), rgba(${PRIMARY_RGB},0.1) 55%);
+      box-shadow:0 14px 28px rgba(${PRIMARY_RGB},0.14);
+      font-size:0.9rem;
+      line-height:1.55;
+      color:var(--ink,var(--primary,#0B1F3B));
+    }
+    .page-short-help strong{
+      display:block;
+      font-size:0.78rem;
+      letter-spacing:.1em;
+      text-transform:uppercase;
       color:var(--accent-strong);
-      text-align:center;
-      line-height:1.3;
+      margin-bottom:0.35rem;
     }
     .mck-import-stepper{
       display:flex;
@@ -7427,6 +7541,75 @@ st.markdown(
       pointer-events:none;
       transition:opacity .3s ease;
       z-index:1000;
+    }
+    .sidebar-nav{
+      display:flex;
+      flex-direction:column;
+      gap:var(--space-2);
+      margin:var(--space-2) 0;
+    }
+    .global-controls{
+      position:sticky;
+      top:0.75rem;
+      right:1rem;
+      z-index:130;
+      margin:0 0 var(--space-2);
+      padding:0.85rem 1rem;
+      border-radius:18px;
+      background:color-mix(in srgb, var(--panel), rgba(${PRIMARY_RGB},0.08) 55%);
+      border:1px solid rgba(${PRIMARY_RGB},0.22);
+      box-shadow:0 18px 36px rgba(${PRIMARY_RGB},0.18);
+    }
+    .global-controls [data-testid="stHorizontalBlock"]{
+      align-items:flex-start;
+      gap:var(--space-2);
+    }
+    .global-controls .stToggle,
+    .global-controls .stSelectbox{
+      margin-bottom:0 !important;
+    }
+    [data-testid="stSidebar"] .sidebar-nav .stButton>button{
+      justify-content:flex-start;
+      gap:0.65rem;
+      font-weight:700;
+      border-radius:12px;
+      border:1px solid rgba(${PRIMARY_RGB},0.18);
+      background:linear-gradient(135deg, rgba(${PRIMARY_RGB},0.08), rgba(${PRIMARY_RGB},0.02));
+      color:var(--ink,var(--primary,#0B1F3B));
+      box-shadow:0 12px 22px rgba(${PRIMARY_RGB},0.12);
+    }
+    [data-testid="stSidebar"] .sidebar-nav .stButton>button:hover:not(:disabled){
+      border-color:rgba(${PRIMARY_RGB},0.32);
+      box-shadow:0 16px 28px rgba(${PRIMARY_RGB},0.18);
+      background:linear-gradient(135deg, rgba(${PRIMARY_RGB},0.12), rgba(${PRIMARY_RGB},0.04));
+    }
+    [data-testid="stSidebar"] .sidebar-nav .stButton>button:disabled{
+      border-color:rgba(${PRIMARY_RGB},0.38);
+      background:rgba(${PRIMARY_RGB},0.16);
+      color:#ffffff;
+    }
+    [data-testid="stSidebar"] .sidebar-nav .stExpander{
+      border-radius:14px !important;
+      border:1px solid rgba(${PRIMARY_RGB},0.18) !important;
+      background:var(--panel) !important;
+      box-shadow:0 14px 26px rgba(${PRIMARY_RGB},0.12) !important;
+      overflow:hidden;
+    }
+    [data-testid="stSidebar"] .sidebar-nav .stExpander .st-expander__header{
+      font-weight:700;
+      letter-spacing:.04em;
+    }
+    [data-testid="stSidebar"] .sidebar-nav .stExpander div[data-baseweb="radio"] label{
+      padding:0.45rem 0.5rem;
+      border-radius:10px;
+      font-weight:600;
+    }
+    [data-testid="stSidebar"] .sidebar-nav .stExpander div[data-baseweb="radio"] label:hover{
+      background:rgba(${PRIMARY_RGB},0.08);
+    }
+    [data-testid="stSidebar"] .sidebar-nav .stExpander div[data-baseweb="radio"] input:checked + div{
+      color:var(--accent-strong);
+      font-weight:700;
     }
     .mobile-nav-toggle{
       position:fixed;
@@ -8038,150 +8221,71 @@ for step in TOUR_STEPS:
     step["section_total"] = TOUR_SECTION_COUNTS.get(section_name, len(TOUR_STEPS))
 
 
+def _queue_tour_nav(nav_key: str) -> None:
+    if nav_key in NAV_KEYS:
+        st.session_state.tour_pending_nav = nav_key
+
+
 def render_step_guide(active_nav_key: str) -> None:
     if not TOUR_STEPS:
         return
 
-    items_html: List[str] = []
+    visible_steps: List[dict[str, object]] = []
     for step in TOUR_STEPS:
         nav_key = step.get("nav_key")
         if not nav_key:
             continue
-
         nav_meta = SIDEBAR_PAGE_LOOKUP.get(nav_key)
         if not nav_meta:
             continue
+        visible_steps.append({"step": step, "meta": nav_meta, "key": nav_key})
 
-        label_text = (
-            nav_meta.get("title")
-            or step.get("title")
-            or step.get("label")
-            or nav_key
-        )
-        icon_text = nav_meta.get("icon", "")
-
-        tooltip_candidates = [
-            NAV_HOVER_LOOKUP.get(nav_key, "").strip(),
-            (
-                f"{step.get('section', '').strip()} {step.get('section_index', 0)} / {step.get('section_total', 0)}"
-                if step.get("section")
-                else ""
-            ),
-            step.get("description", "").strip(),
-            step.get("details", "").strip(),
-        ]
-        tooltip_parts: List[str] = []
-        for candidate in tooltip_candidates:
-            if candidate and candidate not in tooltip_parts:
-                tooltip_parts.append(candidate)
-
-        tooltip_text = "\n".join(tooltip_parts)
-        tooltip_attr = html.escape(tooltip_text, quote=True).replace("\n", "&#10;")
-        title_text = tooltip_text.replace("\n", " ") if tooltip_text else label_text
-        title_attr = html.escape(title_text, quote=True)
-        aria_label_text = tooltip_text.replace("\n", " ") if tooltip_text else label_text
-        aria_label_attr = html.escape(aria_label_text, quote=True)
-
-        icon_html = html.escape(icon_text)
-        label_html = html.escape(label_text)
-        data_active = "true" if nav_key == active_nav_key else "false"
-        aria_current_attr = ' aria-current="step"' if nav_key == active_nav_key else ""
-
-        category_key = html.escape(nav_meta.get("category", ""), quote=True)
-        href = html.escape(TOUR_STEP_ROUTES.get(nav_key, "#"), quote=True)
-
-        item_html = (
-            f'<a class="tour-step-guide__item has-tooltip" data-step="{nav_key}" '
-            f'data-category="{category_key}" href="{href}" '
-            f'data-active="{data_active}" data-tooltip="{tooltip_attr}" title="{title_attr}" '
-            f'tabindex="0" role="listitem" aria-label="{aria_label_attr}"{aria_current_attr}>'
-            f'<span class="tour-step-guide__icon" aria-hidden="true">{icon_html}</span>'
-            f'<span class="tour-step-guide__label">{label_html}</span>'
-            "</a>"
-        )
-        items_html.append(item_html)
-
-    if not items_html:
+    if not visible_steps:
         return
 
-    st.markdown(
-        f'<div class="tour-step-guide" role="list" aria-label="主要ナビゲーションステップ">'
-        f'{"".join(items_html)}</div>',
-        unsafe_allow_html=True,
-    )
+    column_count = min(4, len(visible_steps))
+    guide_container = st.container()
+    with guide_container:
+        st.markdown(
+            "<div class='tour-step-guide' role='list' aria-label='主要ナビゲーションステップ'>",
+            unsafe_allow_html=True,
+        )
+        columns = st.columns(column_count)
+        for idx, payload in enumerate(visible_steps):
+            nav_key = payload["key"]
+            meta = payload["meta"]
+            step = payload["step"]
+            label_text = meta.get("title") or step.get("title") or nav_key
+            icon_text = meta.get("icon", "")
+            tooltip_candidates = [
+                NAV_HOVER_LOOKUP.get(nav_key, "").strip(),
+                (
+                    f"{step.get('section', '').strip()} {step.get('section_index', 0)} / {step.get('section_total', 0)}"
+                    if step.get("section")
+                    else ""
+                ),
+                step.get("description", "").strip(),
+                step.get("details", "").strip(),
+            ]
+            tooltip_parts: List[str] = []
+            for candidate in tooltip_candidates:
+                if candidate and candidate not in tooltip_parts:
+                    tooltip_parts.append(candidate)
+            tooltip_text = "\n".join(tooltip_parts).strip()
+            button_label = " ".join(part for part in (icon_text, label_text) if part)
 
-    components.html(
-        """
-        <script>
-        (function() {
-            const doc = window.parent.document;
-            const findSidebarInput = (navKey) => {
-                if (!navKey) return null;
-                const sidebar = doc.querySelector('section[data-testid="stSidebar"]');
-                if (!sidebar) return null;
-                const label = sidebar.querySelector('label[data-nav-key="' + navKey + '"]');
-                if (!label) return null;
-                return label.querySelector('input[type="radio"]');
-            };
-            const findCategoryInput = (categoryKey) => {
-                if (!categoryKey) return null;
-                const sidebar = doc.querySelector('section[data-testid="stSidebar"]');
-                if (!sidebar) return null;
-                const label = sidebar.querySelector('label[data-category-key="' + categoryKey + '"]');
-                if (label) {
-                    const input = label.querySelector('input[type="radio"]');
-                    if (input) {
-                        return input;
-                    }
-                }
-                const radios = Array.from(sidebar.querySelectorAll('input[type="radio"]'));
-                return radios.find((input) => input.value === categoryKey) || null;
-            };
-            const bind = (attempt = 0) => {
-                const items = Array.from(doc.querySelectorAll('.tour-step-guide__item[data-step]'));
-                if (!items.length) {
-                    if (attempt < 10) {
-                        setTimeout(() => bind(attempt + 1), 120);
-                    }
-                    return;
-                }
-                items.forEach((item) => {
-                    if (item.dataset.navBound === '1') return;
-                    item.dataset.navBound = '1';
-                    const activate = () => {
-                        const navKey = item.dataset.step;
-                        const categoryKey = item.dataset.category;
-                        const input = findSidebarInput(navKey);
-                        const categoryInput = findCategoryInput(categoryKey);
-                        if (categoryInput && !categoryInput.checked) {
-                            categoryInput.click();
-                            setTimeout(() => {
-                                const refreshed = findSidebarInput(navKey);
-                                if (refreshed && !refreshed.checked) {
-                                    refreshed.click();
-                                }
-                            }, 80);
-                            return;
-                        }
-                        if (input && !input.checked) {
-                            input.click();
-                        }
-                    };
-                    item.addEventListener('click', activate);
-                    item.addEventListener('keydown', (event) => {
-                        if (event.key === 'Enter' || event.key === ' ') {
-                            event.preventDefault();
-                            activate();
-                        }
-                    });
-                });
-            };
-            bind();
-        })();
-        </script>
-        """,
-        height=0,
-    )
+            column = columns[idx % column_count]
+            with column:
+                st.button(
+                    button_label or nav_key,
+                    key=f"tour_step_{nav_key}",
+                    help=tooltip_text or None,
+                    use_container_width=True,
+                    on_click=_queue_tour_nav,
+                    kwargs={"nav_key": nav_key},
+                    disabled=nav_key == active_nav_key,
+                )
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_glossary_faq() -> None:
@@ -8282,7 +8386,13 @@ def render_sample_data_hub() -> None:
 
     st.caption(selected_meta.description)
     sample_df = load_sample_csv_dataframe(selected_meta.key)
-    st.dataframe(sample_df.head(5), use_container_width=True)
+    lazy_dataframe(
+        sample_df.head(5),
+        label="サンプルプレビュー",
+        key=f"table_sample_preview_{selected_meta.key}",
+        description="必要なときにサンプルの冒頭5行を確認できます。",
+        use_container_width=True,
+    )
 
     col_download, col_load = st.columns(2)
     with col_download:
@@ -8301,11 +8411,19 @@ def render_sample_data_hub() -> None:
         ):
             try:
                 with loading_message("サンプルデータを初期化しています…"):
-                    ingest_wide_dataframe(
+                    long_df, year_df = ingest_wide_dataframe(
                         sample_df.copy(),
                         product_name_col=selected_meta.name_column,
                         product_code_col=selected_meta.code_column,
                     )
+                register_dataset_source(
+                    "sample",
+                    label=selected_meta.title,
+                    description="テンプレートに沿ったサンプルデータを使用中です。",
+                    monthly=long_df,
+                    yearly=year_df,
+                )
+                activate_dataset_source("sample", silent=True)
                 st.session_state.sample_data_notice = True
                 st.session_state.sample_data_message = (
                     f"{selected_meta.title}を読み込みました。ダッシュボードでサンプル指標を確認できます。"
@@ -8326,7 +8444,15 @@ def render_sample_data_hub() -> None:
             try:
                 with loading_message("デモデータを準備しています…"):
                     demo_long = load_sample_dataset()
-                    process_long_dataframe(demo_long)
+                    normalized, year_df = process_long_dataframe(demo_long)
+                register_dataset_source(
+                    "sample",
+                    label="デモデータ",
+                    description="全機能確認用のデモデータセットです。",
+                    monthly=normalized,
+                    yearly=year_df,
+                )
+                activate_dataset_source("sample", silent=True)
                 st.session_state.sample_data_notice = True
                 st.session_state.sample_data_message = (
                     "デモデータを読み込みました。ダッシュボードで操作感を確認してください。"
@@ -8334,6 +8460,41 @@ def render_sample_data_hub() -> None:
                 st.rerun()
             except Exception as exc:
                 st.error(f"デモデータの準備に失敗しました: {exc}")
+
+
+def render_dataset_source_switcher() -> None:
+    """Allow users to toggle between sample and uploaded datasets."""
+
+    sources = st.session_state.get("dataset_sources", {})
+    if len(sources) <= 1:
+        return
+
+    labels = {key: meta.get("label", key) for key, meta in sources.items()}
+    descriptions = {
+        key: meta.get("description", "") for key, meta in sources.items()
+    }
+    options = list(labels.keys())
+    active = st.session_state.get("active_dataset_source")
+    if active not in options:
+        active = options[0]
+
+    st.markdown("### データセットの切替")
+    selected = st.radio(
+        "表示するデータセット",
+        options,
+        index=options.index(active),
+        format_func=lambda key: labels.get(key, key),
+        help="サンプルデータとアップロード済みデータをワンクリックで切り替えます。",
+        key="dataset_source_selector",
+    )
+
+    if selected != active:
+        activate_dataset_source(selected)
+        st.rerun()
+
+    description = descriptions.get(selected)
+    if description:
+        st.caption(description)
 
 
 @contextmanager
@@ -9009,6 +9170,106 @@ def render_navigation_actions(active_page_key: str) -> None:
                 help="専門用語の解説とよくある質問を表示します。",
             )
         st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_sidebar_navigation(active_page_key: str) -> None:
+    """Render accordion-style navigation with icon labels."""
+
+    st.sidebar.markdown("<div class='sidebar-nav'>", unsafe_allow_html=True)
+    for item in PRIMARY_NAV_MENU:
+        pages = item.get("pages", [])
+        if not pages:
+            continue
+        icon = (item.get("icon") or "").strip()
+        label = item.get("label", "")
+        description = item.get("description", "")
+        is_group_active = active_page_key in pages
+
+        if len(pages) > 1:
+            expander_label = " ".join(part for part in (icon, label) if part)
+            expander_key = f"nav_group_{item['key']}"
+            default_expanded = is_group_active or st.session_state.get(
+                expander_key, False
+            )
+            with st.sidebar.expander(
+                expander_label or item["key"], expanded=default_expanded
+            ):
+                if description:
+                    st.caption(description)
+                sub_state_key = f"nav_sub_{item['key']}"
+                current_value = st.session_state.get(sub_state_key, pages[0])
+                if current_value not in pages:
+                    current_value = pages[0]
+                    st.session_state[sub_state_key] = current_value
+
+                def _format_sub(page_key: str) -> str:
+                    meta = SIDEBAR_PAGE_LOOKUP.get(page_key, {})
+                    parts = [meta.get("icon", ""), NAV_TITLE_LOOKUP.get(page_key, page_key)]
+                    return " ".join(part for part in parts if part)
+
+                selected = st.radio(
+                    "サブメニュー",
+                    pages,
+                    index=pages.index(current_value),
+                    key=f"nav_radio_{item['key']}",
+                    format_func=_format_sub,
+                    label_visibility="collapsed",
+                    help="直接移動したい分析ビューを選択します。",
+                )
+                st.session_state[sub_state_key] = selected
+                if selected != active_page_key:
+                    set_active_page(selected, rerun_on_lock=True)
+                    st.rerun()
+            st.session_state[expander_key] = default_expanded
+        else:
+            page_key = pages[0]
+            button_label = " ".join(part for part in (icon, label) if part)
+            button_key = f"nav_button_{page_key}"
+            help_text = description or SIDEBAR_PAGE_LOOKUP.get(page_key, {}).get(
+                "tooltip", ""
+            )
+            clicked = st.sidebar.button(
+                button_label or page_key,
+                key=button_key,
+                use_container_width=True,
+                help=help_text,
+                disabled=page_key == active_page_key,
+            )
+            if clicked:
+                set_active_page(page_key, rerun_on_lock=True)
+                st.rerun()
+            if page_key == active_page_key and description:
+                st.sidebar.caption(description)
+
+    st.sidebar.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_page_short_help(page_key: str) -> None:
+    """Display a concise how-to summary under the page header."""
+
+    matched_step = next(
+        (step for step in TOUR_STEPS if step.get("nav_key") == page_key), None
+    )
+    if not matched_step:
+        return
+
+    summary_lines: List[str] = []
+    description = (matched_step.get("description") or "").strip()
+    details = (matched_step.get("details") or "").strip()
+    if description:
+        summary_lines.append(description)
+    if details:
+        summary_lines.append(details)
+    if not summary_lines:
+        return
+
+    body_html = "<br>".join(html.escape(line) for line in summary_lines)
+    st.markdown(
+        f"<div class='page-short-help' role='note'><strong>活用ヒント</strong><br>{body_html}</div>",
+        unsafe_allow_html=True,
+    )
+
+
 if st.session_state.get("tour_active", True) and TOUR_STEPS:
     initial_idx = max(0, min(st.session_state.get("tour_step_index", 0), len(TOUR_STEPS) - 1))
     default_key = TOUR_STEPS[initial_idx]["nav_key"]
@@ -9040,82 +9301,9 @@ if NAV_CATEGORY_STATE_KEY not in st.session_state:
         st.session_state[NAV_CATEGORY_STATE_KEY] = default_category
     elif used_category_keys:
         st.session_state[NAV_CATEGORY_STATE_KEY] = used_category_keys[0]
+render_sidebar_navigation(current_page_key)
 
-pending_nav_primary = st.session_state.pop(PENDING_NAV_PRIMARY_KEY, None)
-if pending_nav_primary in PRIMARY_NAV_LOOKUP:
-    st.session_state[NAV_PRIMARY_STATE_KEY] = pending_nav_primary
-
-current_primary_default = PAGE_TO_PRIMARY_LOOKUP.get(
-    current_page_key, PRIMARY_NAV_MENU[0]["key"]
-)
-if (
-    NAV_PRIMARY_STATE_KEY not in st.session_state
-    or st.session_state[NAV_PRIMARY_STATE_KEY] not in PRIMARY_NAV_LOOKUP
-):
-    st.session_state[NAV_PRIMARY_STATE_KEY] = current_primary_default
-
-for item in PRIMARY_NAV_MENU:
-    state_key = f"nav_sub_{item['key']}"
-    pending_sub_key = f"{PENDING_NAV_SUB_PREFIX}{item['key']}"
-    pending_value = st.session_state.pop(pending_sub_key, None)
-    if state_key not in st.session_state and item["pages"]:
-        st.session_state[state_key] = item["pages"][0]
-    if pending_value is not None and pending_value in item["pages"]:
-        st.session_state[state_key] = pending_value
-    if current_page_key in item["pages"]:
-        st.session_state[state_key] = current_page_key
-
-def _format_primary_label(key: str) -> str:
-    item = PRIMARY_NAV_LOOKUP.get(key, {})
-    icon = (item.get("icon") or "").strip()
-    label = item.get("label", key)
-    active_page = st.session_state.get("nav_page", current_page_key)
-    if item.get("pages") and len(item["pages"]) > 1 and active_page in item["pages"]:
-        sub_label = NAV_TITLE_LOOKUP.get(active_page, active_page)
-        combined = f"{label}｜{sub_label}" if sub_label else label
-    else:
-        combined = label
-    return f"{icon} {combined}".strip()
-
-primary_keys = [item["key"] for item in PRIMARY_NAV_MENU]
-selected_primary = st.sidebar.radio(
-    "メインメニュー",
-    primary_keys,
-    key=NAV_PRIMARY_STATE_KEY,
-    format_func=_format_primary_label,
-)
-
-primary_item = PRIMARY_NAV_LOOKUP.get(selected_primary, PRIMARY_NAV_MENU[0])
-primary_pages = primary_item.get("pages", [])
-if not primary_pages:
-    primary_pages = [current_page_key]
-
-target_page_key = primary_pages[0]
-sub_state_key = f"nav_sub_{selected_primary}"
-if len(primary_pages) > 1:
-    current_sub_value = st.session_state.get(sub_state_key, primary_pages[0])
-    if current_sub_value not in primary_pages:
-        current_sub_value = primary_pages[0]
-        st.session_state[sub_state_key] = current_sub_value
-    target_page_key = st.sidebar.selectbox(
-        "表示する機能",
-        primary_pages,
-        key=sub_state_key,
-        format_func=lambda key: NAV_TITLE_LOOKUP.get(key, key),
-        help=primary_item.get("description", "このメニューに含まれる機能を選択します。"),
-    )
-else:
-    if primary_item.get("description"):
-        st.sidebar.caption(primary_item["description"])
-    target_page_key = primary_pages[0]
-
-if target_page_key not in NAV_KEYS:
-    target_page_key = current_page_key
-
-if st.session_state.get("nav_page") != target_page_key:
-    set_active_page(target_page_key, rerun_on_lock=True)
-
-page_key = st.session_state.get("nav_page", target_page_key)
+page_key = st.session_state.get("nav_page", current_page_key)
 previous_key = st.session_state.get("current_page_key")
 if previous_key and previous_key != page_key:
     st.session_state["previous_page_key"] = previous_key
@@ -9128,175 +9316,6 @@ if current_category and st.session_state.get("nav_category") != current_category
 if page_meta.get("tagline"):
     st.sidebar.caption(page_meta["tagline"])
 current_page_key = page_key
-
-nav_script_payload = json.dumps(
-    {
-        "items": PRIMARY_NAV_CLIENT_DATA,
-        "activePage": page_key,
-        "activePrimary": PAGE_TO_PRIMARY_LOOKUP.get(page_key, selected_primary),
-    },
-    ensure_ascii=False,
-)
-nav_script_template = """
-<script>
-const NAV_PRIMARY = {payload};
-(function() {
-    const doc = window.parent.document;
-    const ensureToggle = () => {
-        const root = doc.documentElement;
-        if (!root) return;
-        let toggle = doc.querySelector('.mobile-nav-toggle');
-        if (!toggle) {
-            toggle = doc.createElement('button');
-            toggle.className = 'mobile-nav-toggle';
-            toggle.type = 'button';
-            toggle.setAttribute('aria-label', 'メニューを開閉');
-            toggle.innerHTML = '<span></span><span></span><span></span>';
-            toggle.addEventListener('click', () => {
-                root.classList.toggle('nav-open');
-            });
-            const host = doc.querySelector('header') || doc.body;
-            host.appendChild(toggle);
-        }
-        let overlay = doc.querySelector('.nav-overlay');
-        if (!overlay) {
-            overlay = doc.createElement('div');
-            overlay.className = 'nav-overlay';
-            doc.body.appendChild(overlay);
-            overlay.addEventListener('click', () => {
-                root.classList.remove('nav-open');
-            });
-        }
-    };
-    const apply = (attempt = 0) => {
-        const sidebar = doc.querySelector('section[data-testid="stSidebar"]');
-        if (!sidebar) {
-            if (attempt < 12) {
-                setTimeout(() => apply(attempt + 1), 140);
-            }
-            return;
-        }
-        const radioGroup = sidebar.querySelector('div[data-baseweb="radio"]');
-        if (radioGroup) {
-            const labels = Array.from(radioGroup.querySelectorAll('label'));
-            const metaByKey = Object.fromEntries(NAV_PRIMARY.items.map((item) => [item.key, item]));
-            const updateActive = () => {
-                labels.forEach((label) => {
-                    const input = label.querySelector('input[type="radio"]');
-                    if (!input) return;
-                    const key = input.value;
-                    label.classList.toggle('nav-pill--active', input.checked || key === NAV_PRIMARY.activePrimary);
-                });
-            };
-            labels.forEach((label) => {
-                const input = label.querySelector('input[type="radio"]');
-                if (!input) return;
-                const key = input.value;
-                const meta = metaByKey[key];
-                if (!meta) return;
-                label.classList.add('nav-pill');
-                let iconSpan = label.querySelector('.nav-pill__icon');
-                if (!iconSpan) {
-                    iconSpan = doc.createElement('span');
-                    iconSpan.className = 'nav-pill__icon';
-                    iconSpan.setAttribute('aria-hidden', 'true');
-                    label.insertBefore(iconSpan, label.firstChild);
-                }
-                iconSpan.textContent = meta.icon || '';
-                let bodySpan = label.querySelector('.nav-pill__body');
-                if (!bodySpan) {
-                    bodySpan = doc.createElement('span');
-                    bodySpan.className = 'nav-pill__body';
-                    while (label.childNodes.length > 1) {
-                        bodySpan.appendChild(label.childNodes[1]);
-                    }
-                    label.appendChild(bodySpan);
-                }
-                let titleEl = bodySpan.querySelector('.nav-pill__title');
-                if (!titleEl) {
-                    titleEl = doc.createElement('span');
-                    titleEl.className = 'nav-pill__title';
-                    bodySpan.insertBefore(titleEl, bodySpan.firstChild);
-                }
-                titleEl.textContent = meta.label || '';
-                let descEl = bodySpan.querySelector('.nav-pill__desc');
-                if (!descEl) {
-                    descEl = doc.createElement('span');
-                    descEl.className = 'nav-pill__desc';
-                    bodySpan.appendChild(descEl);
-                }
-                const activePage = NAV_PRIMARY.activePage;
-                if (meta.pages && meta.pages.length > 1 && meta.pages.includes(activePage)) {
-                    const subLabel = meta.page_titles ? (meta.page_titles[activePage] || '') : '';
-                    descEl.textContent = subLabel;
-                    label.classList.add('nav-pill--has-sub');
-                } else {
-                    descEl.textContent = '';
-                    label.classList.remove('nav-pill--has-sub');
-                }
-                const tooltipParts = [];
-                if (meta.description) {
-                    tooltipParts.push(meta.description);
-                }
-                if (meta.pages && meta.pages.length > 1) {
-                    const titles = meta.pages
-                        .map((page) => (meta.page_titles ? (meta.page_titles[page] || '') : ''))
-                        .filter(Boolean);
-                    if (titles.length) {
-                        tooltipParts.push(titles.join(' / '));
-                    }
-                } else if (meta.pages && meta.pages.length === 1) {
-                    const single = meta.pages[0];
-                    const tip = meta.page_tooltips ? (meta.page_tooltips[single] || '') : '';
-                    if (tip) {
-                        tooltipParts.push(tip);
-                    }
-                }
-                const tooltipText = tooltipParts.join('\n').trim();
-                const ariaLabel = tooltipText ? `${meta.label}: ${tooltipText}` : meta.label;
-                label.setAttribute('title', tooltipText || meta.label || '');
-                label.dataset.tooltip = tooltipText;
-                input.setAttribute('aria-label', ariaLabel || meta.label || '');
-                input.setAttribute('title', tooltipText || meta.label || '');
-                if (!input.dataset.navEnhanced) {
-                    input.addEventListener('change', () => {
-                        updateActive();
-                        doc.documentElement.classList.remove('nav-open');
-                    });
-                    input.dataset.navEnhanced = 'true';
-                }
-            });
-            updateActive();
-        }
-        const selects = Array.from(sidebar.querySelectorAll('select'));
-        selects.forEach((select) => {
-            if (!select.dataset.navEnhanced) {
-                select.addEventListener('change', () => {
-                    doc.documentElement.classList.remove('nav-open');
-                });
-                select.dataset.navEnhanced = 'true';
-            }
-        });
-        const root = doc.documentElement;
-        if (root && NAV_PRIMARY.activePage) {
-            if (root.getAttribute('data-active-page') !== NAV_PRIMARY.activePage) {
-                root.setAttribute('data-active-page', NAV_PRIMARY.activePage);
-            }
-            const container = doc.querySelector('main .block-container');
-            if (container) {
-                container.classList.remove('page-transition-fade');
-                void container.offsetWidth;
-                container.classList.add('page-transition-fade');
-            }
-        }
-    };
-    ensureToggle();
-    apply();
-})();
-</script>
-"""
-nav_script = nav_script_template.replace("{payload}", nav_script_payload)
-components.html(nav_script, height=0)
 
 if st.session_state.get("tour_active", True):
     for idx, step in enumerate(TOUR_STEPS):
@@ -9464,6 +9483,7 @@ active_category = (
 render_breadcrumbs(active_category, page_key)
 render_quick_nav_tabs(page_key)
 render_navigation_actions(page_key)
+render_page_short_help(page_key)
 
 reset_message = st.session_state.pop("reset_feedback", None)
 if reset_message:
@@ -9508,6 +9528,8 @@ if page == "データ取込":
         "CSV/Excel取込、テンプレート選択、デモデータ読込みを一箇所で実行します。",
         icon="📥",
     )
+
+    render_dataset_source_switcher()
 
     render_import_progress_bar()
     render_import_stepper()
@@ -9638,8 +9660,11 @@ No auto-calculated metrics are linked to this template."""
                 "テンプレートの列構成をプレビュー / Preview template layout",
                 expanded=False,
             ):
-                st.dataframe(
+                lazy_dataframe(
                     template_preview_df.head(5),
+                    label="テンプレートプレビュー",
+                    key=f"table_template_preview_{active_template}",
+                    description="推奨列のプレビューは必要時のみ描画されます。",
                     use_container_width=True,
                 )
                 st.caption(
@@ -9778,7 +9803,13 @@ No auto-calculated metrics are linked to this template."""
                 expanded=True,
             ):
                 styled_preview = style_upload_preview(df_raw, diagnostics)
-                st.dataframe(styled_preview, use_container_width=True)
+                lazy_dataframe(
+                    styled_preview,
+                    label="アップロードプレビュー",
+                    key="table_import_preview",
+                    description="ファイルの先頭行は必要に応じて描画します。",
+                    use_container_width=True,
+                )
                 st.caption(
                     "黄色は欠損セル、赤は数値に変換できなかったセル、青は検出した月度列を示しています。"
                 )
@@ -9832,6 +9863,14 @@ No auto-calculated metrics are linked to this template."""
                                 product_name_col=product_name_col,
                                 product_code_col=code_col,
                             )
+                        register_dataset_source(
+                            "uploaded",
+                            label=f"アップロード ({file.name})",
+                            description="最新のアップロードファイルを分析に使用しています。",
+                            monthly=long_df,
+                            yearly=year_df,
+                        )
+                        activate_dataset_source("uploaded", silent=True)
 
                         st.success(
                             """取込完了。ダッシュボードへ移動して可視化を確認してください。
@@ -10613,8 +10652,11 @@ elif page == "経営ダッシュボード":
                         "粗利",
                         "粗利率",
                     ]
-                    st.dataframe(
+                    lazy_dataframe(
                         detail_df[display_cols],
+                        label="売上明細リスト",
+                        key="table_dashboard_sales_detail",
+                        description="ダッシュボード明細は必要に応じて描画します。",
                         use_container_width=True,
                         hide_index=True,
                         column_config={
@@ -10859,8 +10901,11 @@ elif page == "経営ダッシュボード":
             ),
         ]
         pnl_df = pd.DataFrame(pnl_rows, columns=["項目", "金額", "売上比率"])
-        st.dataframe(
+        lazy_dataframe(
             pnl_df,
+            label="損益計算書",
+            key="table_dashboard_pnl",
+            description="損益計算書テーブルは必要に応じて描画します。",
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -10955,8 +11000,11 @@ elif page == "経営ダッシュボード":
                 0.0,
             )
             reorder_display = reorder_df.sort_values("推定日数").head(20)
-            st.dataframe(
+            lazy_dataframe(
                 reorder_display,
+                label="在庫発注リスト",
+                key="table_reorder_suggestions",
+                description="在庫発注候補は必要なときだけ表示します。",
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -11088,8 +11136,11 @@ elif page == "経営ダッシュボード":
         else:
             cash_detail["日付"] = cash_detail["日付"].dt.strftime("%Y-%m-%d")
             cash_cols = ["日付", "店舗", "商品", "売上", "粗利"]
-            st.dataframe(
+            lazy_dataframe(
                 cash_detail[cash_cols],
+                label="資金明細",
+                key="table_cash_detail",
+                description="資金明細テーブルは必要な時だけ表示します。",
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -12088,8 +12139,11 @@ elif page == "ランキング":
         "寄与度(%)",
     ]
     st.markdown("#### Topランキング")
-    st.dataframe(
+    lazy_dataframe(
         display_df[ranking_table_cols].head(top_limit),
+        label="Topランキング",
+        key="table_ranking_top",
+        description="上位ランキングは必要に応じて描画します。",
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -12106,8 +12160,11 @@ elif page == "ランキング":
     )
 
     st.markdown("#### Bottomランキング")
-    st.dataframe(
+    lazy_dataframe(
         display_df.loc[bottom_df.index, ranking_table_cols],
+        label="Bottomランキング",
+        key="table_ranking_bottom",
+        description="下位ランキングは必要に応じて描画します。",
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -12124,8 +12181,11 @@ elif page == "ランキング":
     )
 
     st.markdown("#### 全体テーブル")
-    st.dataframe(
+    lazy_dataframe(
         display_df,
+        label="ランキング全体",
+        key="table_ranking_all",
+        description="ランキング全体表は必要時に描画します。",
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -12926,8 +12986,11 @@ elif page == "SKU詳細":
             with st.expander("AIサマリー", expanded=ai_on):
                 if ai_on and not snap.empty:
                     st.info(_ai_sum_df(snap[["year_sum", "yoy", "delta"]]))
-            st.dataframe(
+            lazy_dataframe(
                 snap[["product_code", "product_name", "year_sum", "yoy", "delta"]],
+                label="SKUサマリー",
+                key="table_sku_multi_snapshot",
+                description="選択したSKUの一覧は必要時に描画します。",
                 use_container_width=True,
             )
             st.download_button(
@@ -13086,7 +13149,13 @@ elif page == "異常検知":
                 "score": "スコア",
             }
         )
-        st.dataframe(view_table, use_container_width=True)
+        lazy_dataframe(
+            view_table,
+            label="異常検知一覧",
+            key="table_anomaly_overview",
+            description="異常スコア一覧は必要時に描画します。",
+            use_container_width=True,
+        )
         st.caption("値は指定した単位換算、スコアはローカル回帰残差の標準化値です。")
         st.download_button(
             "CSVダウンロード",
@@ -13595,7 +13664,13 @@ elif page == "アラート":
     if alerts.empty:
         st.success("閾値に該当するアラートはありません。")
     else:
-        st.dataframe(alerts, use_container_width=True)
+        lazy_dataframe(
+            alerts,
+            label="アラート一覧",
+            key="table_alerts",
+            description="閾値アラート一覧は必要時に描画します。",
+            use_container_width=True,
+        )
         st.download_button(
             "CSVダウンロード",
             data=alerts.to_csv(index=False).encode("utf-8-sig"),
