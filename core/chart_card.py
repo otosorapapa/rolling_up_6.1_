@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from plotly.colors import hex_to_rgb, sample_colorscale
 import streamlit as st
+from typing import Callable
 
 from services import (
     slopes_snapshot,
@@ -19,7 +21,7 @@ from core.plot_utils import (
     render_plotly_with_spinner,
 )
 
-UNIT_SCALE = {"円": 1, "千円": 1_000, "百万円": 1_000_000}
+UNIT_SCALE = {"円": 1, "千円": 1_000, "百万円": 1_000_000, "指数": 1, "%": 1}
 MAX_DISPLAY_PRODUCTS = 60
 TREND_POS_THRESHOLD = 0.05
 TREND_NEG_THRESHOLD = -0.05
@@ -106,7 +108,10 @@ def marker_step(dates, target_points=24):
 
 
 def limit_products(
-    dfp: pd.DataFrame, max_products: int = MAX_DISPLAY_PRODUCTS
+    dfp: pd.DataFrame,
+    max_products: int = MAX_DISPLAY_PRODUCTS,
+    *,
+    value_col: str = "year_sum",
 ) -> pd.DataFrame:
     """Limit dataframe to at most ``max_products`` unique product codes.
 
@@ -117,7 +122,8 @@ def limit_products(
     if len(codes) <= max_products:
         return dfp
     snapshot = dfp.sort_values("month").groupby("product_code").tail(1)
-    top_codes = snapshot.nlargest(max_products, "year_sum")["product_code"]
+    sort_col = value_col if value_col in snapshot.columns else "year_sum"
+    top_codes = snapshot.nlargest(max_products, sort_col)["product_code"]
     return dfp[dfp["product_code"].isin(top_codes)].copy()
 
 
@@ -451,6 +457,7 @@ def toolbar_sku_detail(
     )
 
 
+
 def build_chart_card(
     df_long,
     selected_codes,
@@ -460,17 +467,28 @@ def build_chart_card(
     *,
     height: int | None = None,
     config: dict | None = None,
+    value_column: str = "year_sum",
+    highlight_codes: set[str] | None = None,
 ):
     months = {"12ヶ月": 12, "24ヶ月": 24, "36ヶ月": 36}[tb["period"]]
+    value_col = value_column if value_column in df_long.columns else "year_sum"
     dfp = df_long.sort_values("month").groupby("product_code").tail(months)
     if selected_codes:
         dfp = dfp[dfp["product_code"].isin(selected_codes)].copy()
     if dfp["product_code"].nunique() > MAX_DISPLAY_PRODUCTS:
         st.warning(f"表示件数が多いため上位{MAX_DISPLAY_PRODUCTS}件のみを描画します")
-        dfp = limit_products(dfp)
+        dfp = limit_products(dfp, value_col=value_col)
 
-    scale = UNIT_SCALE[tb["unit"]]
+    unit_key = tb.get("unit", "円")
+    scale = float(tb.get("unit_scale", UNIT_SCALE.get(unit_key, 1)))
+    unit_label = tb.get("unit_label", unit_key)
+    metric_label = tb.get("metric_label", "値")
+    value_precision = int(tb.get("value_precision", 0 if scale >= 1 else 2))
+    disp_col = tb.get("display_column", f"{value_col}_disp")
+
     dfp = dfp.sort_values("month").copy()
+    if "display_name" not in dfp.columns:
+        dfp["display_name"] = dfp["product_name"].fillna(dfp["product_code"])
     if "yoy" not in dfp.columns:
         dfp["yoy"] = np.nan
     if "delta" not in dfp.columns:
@@ -478,7 +496,7 @@ def build_chart_card(
 
     if multi_mode and tb.get("slope_conf"):
         sc = tb["slope_conf"]
-        snap = slopes_snapshot(dfp, n=sc["n_win"])
+        snap = slopes_snapshot(dfp, n=sc["n_win"], y_col=value_col)
         key = {"円/月": "slope_yen", "%/月": "slope_ratio", "zスコア": "slope_z"}[
             sc["thr_type"]
         ]
@@ -491,9 +509,9 @@ def build_chart_card(
         if sc.get("quick") and sc["quick"] != "なし":
             snapshot = dfp.sort_values("month").groupby("product_code").tail(1)
             if sc["quick"] == "Top5":
-                quick_codes = snapshot.nlargest(5, "year_sum")["product_code"]
+                quick_codes = snapshot.nlargest(5, value_col)["product_code"]
             elif sc["quick"] == "Top10":
-                quick_codes = snapshot.nlargest(10, "year_sum")["product_code"]
+                quick_codes = snapshot.nlargest(10, value_col)["product_code"]
             elif sc["quick"] == "最新YoY上位":
                 quick_codes = (
                     snapshot.dropna(subset=["yoy"])
@@ -501,8 +519,12 @@ def build_chart_card(
                     .head(10)["product_code"]
                 )
             elif sc["quick"] == "直近6M伸長上位":
+                tmp = dfp.rename(columns={value_col: "year_sum"})
                 quick_codes = top_growth_codes(
-                    dfp, dfp["month"].max(), window=6, top=10
+                    tmp,
+                    tmp["month"].max(),
+                    window=6,
+                    top=10,
                 )
             else:
                 quick_codes = snapshot["product_code"]
@@ -514,6 +536,7 @@ def build_chart_card(
                 window=max(6, eff_n * 2),
                 alpha_ratio=0.02 * (1.0 - sc["sens"]),
                 amp_ratio=0.06 * (1.0 - sc["sens"]),
+                y_col=value_col,
             )
             pick_map = {
                 "急勾配": snap.loc[snap["slope_z"].abs() >= 1.5, "product_code"],
@@ -525,13 +548,24 @@ def build_chart_card(
         else:
             dfp = dfp[dfp["product_code"].isin(codes_by_slope)]
 
-    dfp["year_sum_disp"] = dfp["year_sum"] / scale
-    dfp["yoy_display"] = dfp["yoy"].apply(
-        lambda v: "—" if pd.isna(v) else f"{v * 100:+.1f}%"
-    )
-    dfp["delta_display"] = dfp["delta"].apply(
-        lambda v: "—" if pd.isna(v) else f"{v / scale:+,.0f} {tb['unit']}"
-    )
+    dfp[disp_col] = dfp[value_col] / scale
+
+    if callable(tb.get("yoy_formatter")):
+        yoy_formatter = tb["yoy_formatter"]  # type: ignore[assignment]
+    else:
+        yoy_formatter = lambda v: "—" if pd.isna(v) else f"{v * 100:+.1f}%"
+
+    if callable(tb.get("delta_formatter")):
+        delta_formatter = tb["delta_formatter"]  # type: ignore[assignment]
+    else:
+        delta_formatter = (
+            lambda v: "—"
+            if pd.isna(v)
+            else f"{v / scale:+,.0f} {unit_label}"
+        )
+
+    dfp["yoy_display"] = dfp["yoy"].apply(yoy_formatter)
+    dfp["delta_display"] = dfp["delta"].apply(delta_formatter)
     latest_snapshot = (
         dfp.groupby("display_name", as_index=False)
         .tail(1)
@@ -549,9 +583,9 @@ def build_chart_card(
 
     line_kwargs = dict(
         x="month",
-        y="year_sum_disp",
+        y=disp_col,
         color="display_name",
-        custom_data=["display_name", "yoy_display", "delta_display"],
+        custom_data=["display_name", "yoy_display", "delta_display", "product_code"],
     )
     if color_map:
         line_kwargs["color_discrete_map"] = color_map
@@ -559,13 +593,14 @@ def build_chart_card(
     hovertemplate = (
         "<b>%{customdata[0]}</b><br>"
         "月：%{x|%Y-%m}<br>"
-        f"年計：%{{y:,.0f}} {tb['unit']}<br>"
-        "前年同月比：%{customdata[1]}<br>"
-        "前月差：%{customdata[2]}<extra></extra>"
+        f"{metric_label}：%{{y:,.{value_precision}f}} {unit_label}<br>"
+        "YoY：%{customdata[1]}<br>"
+        "Δ：%{customdata[2]}<br>"
+        "<a href='?nav_page=SKU詳細&sku=%{customdata[3]}'>SKU詳細ページへ</a><extra></extra>"
     )
-    fig.update_yaxes(title_text=f"売上 年計（{tb['unit']}）", tickformat="~,d")
+    fig.update_yaxes(title_text=f"{metric_label}（{unit_label}）", tickformat="~,d")
     fig.update_traces(mode="lines+markers", hovertemplate=hovertemplate)
-    if band_range:
+    if band_range and all(pd.notna(band_range)):
         low, high = band_range
         fig.add_hrect(
             y0=low / scale,
@@ -599,6 +634,7 @@ def build_chart_card(
         ),
         margin=dict(l=72, r=40, t=60, b=80),
     )
+
     latest_yoy_map = (
         latest_snapshot["yoy"].to_dict() if "yoy" in latest_snapshot.columns else {}
     )
@@ -616,55 +652,91 @@ def build_chart_card(
         else:
             tr.line.width = 2.4
     line_colors = {
-        tr.name: tr.line.color
+        tr.name: getattr(tr.line, "color", None)
         for tr in fig.data
-        if "lines" in getattr(tr, "mode", "")
+        if hasattr(tr, "name") and getattr(tr, "line", None) is not None
     }
 
-    if tb.get("forecast_method") and tb["forecast_method"] != "なし":
-        method = tb["forecast_method"]
-        win = tb.get("forecast_window", 12)
-        horizon = tb.get("forecast_horizon", 6)
-        k = tb.get("forecast_k", 2.0)
-        robust = tb.get("forecast_robust", False)
-        for name, d in dfp.groupby("display_name"):
-            s = d.sort_values("month").set_index("month")["year_sum"]
-            if method == "ローカル線形±kσ":
-                f, lo, hi = forecast_linear_band(
-                    s, window=win, horizon=horizon, k=k, robust=robust
-                )
-            elif method == "Holt線形":
-                f = forecast_holt_linear(s, horizon=horizon)
-                f2, lo, hi = forecast_linear_band(
-                    s, window=win, horizon=horizon, k=k, robust=robust
-                )
-                lo, hi = f - (f2 - lo), f + (hi - f2)
-            elif method == "移動平均±kσ":
-                f, lo, hi = band_from_moving_stats(
-                    s, window=win, horizon=horizon, k=k, robust=False
-                )
-            else:
-                f, lo, hi = band_from_moving_stats(
-                    s, window=win, horizon=horizon, k=k, robust=True
-                )
-            if len(f) == 0:
-                continue
-            last_t = pd.to_datetime(d["month"].max())
-            future_idx = pd.period_range(
-                last_t.to_period("M"), periods=horizon, freq="M"
-            ).to_timestamp() + pd.offsets.MonthBegin(1)
-            base_color = line_colors.get(name)
-            line_style = dict(dash="dash")
-            if base_color:
-                line_style["color"] = base_color
-            fig.add_scatter(
-                x=future_idx,
-                y=f / scale,
-                mode="lines",
-                name=f"{name}予測",
-                line=line_style,
-                showlegend=False,
+    if tb.get("peak_on"):
+        peak_rows = (
+            dfp.sort_values(value_col)
+            .groupby("display_name")
+            .tail(1)
+            .dropna(subset=[value_col])
+        )
+        theme_is_dark = st.get_option("theme.base") == "dark"
+        halo_color = "rgba(20,20,20,0.65)" if theme_is_dark else "rgba(255,255,255,0.9)"
+        for _, row in peak_rows.iterrows():
+            arrow = line_colors.get(row["display_name"], color_map.get(row["display_name"], "#0B84A5"))
+            fig.add_annotation(
+                x=row["month"],
+                y=row[disp_col],
+                text=f"{row['display_name']}\n{row[disp_col]:.{value_precision}f} {unit_label}",
+                showarrow=True,
+                arrowhead=2,
+                ax=0,
+                ay=-40,
+                bgcolor="rgba(15,32,55,0.85)",
+                bordercolor="rgba(15,32,55,0.95)",
+                font=dict(color="#ffffff", size=11),
+                borderpad=4,
+                opacity=0.95,
+                arrowcolor=arrow,
+                align="left",
+                borderwidth=1,
             )
+
+    if tb.get("forecast_method") and tb["forecast_method"] != "なし":
+        forecast_method = tb["forecast_method"]
+        window = int(tb.get("forecast_window", 12))
+        horizon = int(tb.get("forecast_horizon", 6))
+        k = float(tb.get("forecast_k", 2.0))
+        robust = bool(tb.get("forecast_robust", False))
+        for name, group in dfp.groupby("display_name"):
+            y = group.sort_values("month")[value_col].values
+            x = pd.to_datetime(group.sort_values("month")["month"]).values
+            base_color = line_colors.get(name)
+            if len(y) < window:
+                continue
+            if forecast_method == "ローカル線形±kσ":
+                lo, hi, future_idx = forecast_linear_band(
+                    x,
+                    y,
+                    window=window,
+                    horizon=horizon,
+                    k=k,
+                    robust=robust,
+                )
+            elif forecast_method == "Holt線形":
+                future_idx, forecast_values = forecast_holt_linear(
+                    x, y, horizon=horizon
+                )
+                lo = forecast_values - k * np.nanstd(y)
+                hi = forecast_values + k * np.nanstd(y)
+            elif forecast_method == "移動平均±kσ":
+                future_idx, forecast_values = band_from_moving_stats(
+                    x,
+                    y,
+                    window=window,
+                    horizon=horizon,
+                    k=k,
+                    robust=False,
+                )
+                lo = forecast_values["lo"].values
+                hi = forecast_values["hi"].values
+            else:
+                future_idx, forecast_values = band_from_moving_stats(
+                    x,
+                    y,
+                    window=window,
+                    horizon=horizon,
+                    k=k,
+                    robust=True,
+                )
+                lo = forecast_values["lo"].values
+                hi = forecast_values["hi"].values
+            if future_idx is None or len(future_idx) == 0:
+                continue
             fill_color = "rgba(113,178,255,.18)"
             if base_color and isinstance(base_color, str) and base_color.startswith("#"):
                 r, g, b = hex_to_rgb(base_color)
@@ -690,7 +762,7 @@ def build_chart_card(
         robust = tb["anomaly"].startswith("MAD")
         thr = 3.5 if robust else 2.5
         for name, d in dfp.groupby("display_name"):
-            s = d.sort_values("month").set_index("month")["year_sum"]
+            s = d.sort_values("month").set_index("month")[value_col]
             res = detect_linear_anomalies(
                 s, window=tb.get("forecast_window", 12), threshold=thr, robust=robust
             )
@@ -704,7 +776,10 @@ def build_chart_card(
                 marker=dict(symbol="triangle-up", color="red", size=10),
                 showlegend=False,
                 customdata=np.stack([res["score"]], axis=-1),
-                hovertemplate=f"<b>{name}</b><br>月：%{{x|%Y-%m}}<br>値：%{{y:,.0f}} {tb['unit']}<br>スコア：%{{customdata[0]:.2f}}<extra></extra>",
+                hovertemplate=(
+                    f"<b>{name}</b><br>月：%{{x|%Y-%m}}<br>{metric_label}：%{{y:,.{value_precision}f}} {unit_label}<br>"
+                    "異常スコア：%{customdata[0]:.2f}<extra></extra>"
+                ),
             )
 
     theme_is_dark = st.get_option("theme.base") == "dark"
@@ -719,8 +794,8 @@ def build_chart_card(
     elif tb["node_mode"] == "主要ノードのみ":
         g = dfp.sort_values("month").groupby("display_name")
         latest = g.tail(1)
-        idxmax = dfp.loc[g["year_sum"].idxmax().dropna()]
-        idxmin = dfp.loc[g["year_sum"].idxmin().dropna()]
+        idxmax = dfp.loc[g[value_col].idxmax().dropna()]
+        idxmin = dfp.loc[g[value_col].idxmin().dropna()]
         ystart = g.head(1)
         df_nodes = pd.concat([latest, idxmax, idxmin, ystart]).drop_duplicates(
             ["display_name", "month"]
@@ -733,7 +808,7 @@ def build_chart_card(
     for name, d in df_nodes.groupby("display_name"):
         fig.add_scatter(
             x=d["month"],
-            y=d["year_sum_disp"],
+            y=d[disp_col],
             mode="markers",
             name=name,
             legendgroup=name,
@@ -746,23 +821,75 @@ def build_chart_card(
                 color=line_colors.get(name, color_map.get(name)),
             ),
             customdata=np.stack(
-                [d["display_name"], d["yoy_display"], d["delta_display"]],
+                [d["display_name"], d["yoy_display"], d["delta_display"], d["product_code"]],
                 axis=-1,
             ),
             hovertemplate=hovertemplate,
         )
 
-    if tb["enable_avoid"]:
+    if tb.get("enable_avoid"):
         add_latest_labels_no_overlap(
             fig,
             dfp,
             label_col="label_with_yoy",
             x_col="month",
-            y_col="year_sum_disp",
+            y_col=disp_col,
             max_labels=tb["max_labels"],
             min_gap_px=tb["gap_px"],
             alternate_side=tb["alt_side"],
         )
+
+    if multi_mode and tb.get("show_avg_band"):
+        grouped = dfp.groupby("month")[disp_col]
+        summary = grouped.agg(["mean", "std"]).reset_index()
+        summary["upper"] = summary["mean"] + summary["std"]
+        summary["lower"] = summary["mean"] - summary["std"]
+        fig.add_trace(
+            go.Scatter(
+                x=summary["month"],
+                y=summary["mean"],
+                mode="lines",
+                name="平均",
+                legendgroup="平均帯",
+                line=dict(color="#2B7A78", width=2, dash="dash"),
+                hovertemplate=(
+                    "<b>平均</b><br>月：%{x|%Y-%m}<br>"
+                    f"{metric_label}：%{{y:,.{value_precision}f}} {unit_label}<extra></extra>"
+                ),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=summary["month"],
+                y=summary["upper"],
+                mode="lines",
+                legendgroup="平均帯",
+                line=dict(width=0),
+                showlegend=False,
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=summary["month"],
+                y=summary["lower"],
+                mode="lines",
+                fill="tonexty",
+                legendgroup="平均帯",
+                line=dict(width=0, color="rgba(43,122,120,0.15)"),
+                fillcolor="rgba(43,122,120,0.12)",
+                showlegend=False,
+                name="±1σ",
+                hoverinfo="skip",
+            )
+        )
+
+    if highlight_codes:
+        for tr in fig.data:
+            name = getattr(tr, "name", "")
+            if name in highlight_codes:
+                tr.update(line=dict(width=3.4))
+            elif name not in {"平均", "±1σ"}:
+                tr.update(line=dict(width=1.6))
 
     fig = apply_elegant_theme(fig, theme=st.session_state.get("ui_theme", "light"))
     plot_height = height or int(tb.get("chart_height", 600))
