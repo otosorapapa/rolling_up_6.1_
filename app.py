@@ -719,6 +719,29 @@ def loading_message(detail: Optional[str] = None):
         yield
 
 
+@contextmanager
+def dashboard_section(
+    label: str,
+    *,
+    variant: str = "primary",
+    target: "st.delta_generator.DeltaGenerator" = st,
+):
+    """Provide a styled section wrapper with accessible labeling."""
+
+    safe_label = html.escape(label)
+    classes = "dashboard-section"
+    if variant:
+        classes += f" dashboard-section--{variant}"
+    target.markdown(
+        f"<section class='{classes}' role='region' aria-label='{safe_label}'>",
+        unsafe_allow_html=True,
+    )
+    try:
+        yield
+    finally:
+        target.markdown("</section>", unsafe_allow_html=True)
+
+
 def render_status_message(
     state: str,
     *,
@@ -1202,6 +1225,35 @@ body, .stApp, [data-testid="stAppViewContainer"]{
   font-family:var(--font-base);
   font-size:1rem;
   line-height:1.48;
+}
+.dashboard-layout__primary,
+.dashboard-layout__secondary{
+  display:flex;
+  flex-direction:column;
+  gap:var(--space-3);
+}
+.dashboard-section{
+  background:color-mix(in srgb, var(--surface-0) 85%, transparent 15%);
+  border:1px solid color-mix(in srgb, var(--border), transparent 45%);
+  border-radius:18px;
+  padding:var(--space-3);
+  margin-bottom:var(--space-3);
+  box-shadow:0 10px 24px rgba(var(--primary-rgb,11,31,59),0.08);
+}
+.dashboard-section--secondary{
+  background:color-mix(in srgb, var(--surface-alt) 70%, transparent 30%);
+}
+.dashboard-section--tertiary{
+  background:color-mix(in srgb, var(--surface-2) 65%, transparent 35%);
+}
+.dashboard-section > h4,
+.dashboard-section > h5{
+  margin-top:0;
+}
+.dashboard-section__footer{
+  margin-top:var(--space-2);
+  color:var(--muted);
+  font-size:0.85rem;
 }
 .chip{
   display:inline-flex;
@@ -9950,10 +10002,16 @@ elif page == "経営ダッシュボード":
     period_options = ["直近12ヶ月", "今年", "今月"]
     store_options = ["全店舗"] + sorted(df_sales["店舗"].astype(str).unique().tolist())
     unit_options = ["円", "千円", "百万円"]
+    category_options = sorted(df_sales["カテゴリ"].astype(str).unique().tolist())
 
     filters_state = st.session_state.setdefault(
         "executive_filters",
-        {"period": "直近12ヶ月", "store": "全店舗", "unit": "円"},
+        {
+            "period": "直近12ヶ月",
+            "store": "全店舗",
+            "unit": "円",
+            "categories": category_options,
+        },
     )
     if filters_state.get("period") not in period_options:
         filters_state["period"] = "直近12ヶ月"
@@ -9961,6 +10019,16 @@ elif page == "経営ダッシュボード":
         filters_state["store"] = "全店舗"
     if filters_state.get("unit") not in unit_options:
         filters_state["unit"] = "円"
+    if not isinstance(filters_state.get("categories"), list) or not filters_state.get(
+        "categories"
+    ):
+        filters_state["categories"] = category_options
+    else:
+        filters_state["categories"] = [
+            cat for cat in filters_state.get("categories", []) if cat in category_options
+        ] or category_options
+
+    selected_categories = filters_state.get("categories", category_options)
 
     def resolve_periods(label: str, latest: pd.Period) -> pd.PeriodIndex:
         if label == "直近12ヶ月":
@@ -9981,10 +10049,16 @@ elif page == "経営ダッシュボード":
             return df_sales.iloc[0:0].copy()
         return df_sales[df_sales["month_period"].isin(periods)].copy()
 
-    def apply_store_filter(source: pd.DataFrame) -> pd.DataFrame:
-        if filters_state["store"] == "全店舗":
-            return source.copy()
-        return source[source["店舗"] == filters_state["store"]].copy()
+    def apply_filters(
+        source: pd.DataFrame, *, include_store: bool = True
+    ) -> pd.DataFrame:
+        filtered = source.copy()
+        if include_store and filters_state["store"] != "全店舗":
+            filtered = filtered[filtered["店舗"] == filters_state["store"]]
+        selected = filters_state.get("categories", category_options)
+        if selected:
+            filtered = filtered[filtered["カテゴリ"].isin(selected)]
+        return filtered
 
     def format_period_window(periods: pd.PeriodIndex) -> str:
         if len(periods) == 0:
@@ -9993,32 +10067,77 @@ elif page == "経営ダッシュボード":
         end = periods.max().strftime("%Y-%m")
         return f"{start}〜{end}" if start != end else start
 
-    top_row = st.columns([2.8, 1.1, 1.1, 1.1])
-    highlight_area = top_row[0].container()
-    with top_row[1]:
-        period = st.selectbox(
-            "期間",
-            period_options,
-            index=period_options.index(filters_state["period"]),
-            key="executive_period_select",
-        )
+    with st.sidebar:
+        with dashboard_section("ダッシュボードフィルター", variant="secondary", target=st.sidebar):
+            period = st.selectbox(
+                "期間",
+                period_options,
+                index=period_options.index(filters_state["period"]),
+                key="executive_period_select",
+                help="対象期間を切り替えます。",
+            )
+            store = st.selectbox(
+                "店舗",
+                store_options,
+                index=store_options.index(filters_state["store"]),
+                key="executive_store_select",
+                help="店舗フィルターを選択します。",
+            )
+            unit = st.selectbox(
+                "単位",
+                unit_options,
+                index=unit_options.index(filters_state["unit"]),
+                key="executive_unit_select",
+                help="金額表示単位を選びます。",
+            )
+            categories = st.multiselect(
+                "カテゴリ",
+                category_options,
+                default=selected_categories,
+                key="executive_category_select",
+                help="分析対象とする商品カテゴリを選択します。",
+            )
+            filters_state["categories"] = categories or category_options
+        query_params = _get_query_params()
+        active_tab = query_params.get("dashboard_tab", [])
+        active_tab = active_tab[-1] if active_tab else "売上"
+        tab_labels = ["売上", "粗利", "在庫", "資金"]
+        if active_tab not in tab_labels:
+            active_tab = tab_labels[0]
+
+        def _update_dashboard_query(value: str) -> None:
+            params = _get_query_params()
+            params["dashboard_tab"] = [value]
+            query_proxy = getattr(st, "query_params", None)
+            try:
+                if query_proxy is not None:
+                    query_proxy.clear()
+                    for key, vals in params.items():
+                        if not vals:
+                            continue
+                        query_proxy[key] = vals if len(vals) > 1 else vals[0]
+                else:
+                    st.experimental_set_query_params(
+                        **{k: (v if len(v) > 1 else v[0]) for k, v in params.items()}
+                    )
+            except StreamlitAPIException:
+                pass
+
+        with dashboard_section("ビュー切替", variant="secondary", target=st.sidebar):
+            selected_tab = st.radio(
+                "表示ビュー",
+                tab_labels,
+                index=tab_labels.index(active_tab),
+                key="executive_nav_radio",
+            )
+            if selected_tab != active_tab:
+                _update_dashboard_query(selected_tab)
+                active_tab = selected_tab
+
     filters_state["period"] = period
-    with top_row[2]:
-        store = st.selectbox(
-            "店舗",
-            store_options,
-            index=store_options.index(filters_state["store"]),
-            key="executive_store_select",
-        )
     filters_state["store"] = store
-    with top_row[3]:
-        unit = st.selectbox(
-            "単位",
-            unit_options,
-            index=unit_options.index(filters_state["unit"]),
-            key="executive_unit_select",
-        )
     filters_state["unit"] = unit
+    selected_categories = filters_state.get("categories", category_options)
 
     st.session_state["executive_period"] = period
     st.session_state["executive_store"] = store
@@ -10034,6 +10153,7 @@ elif page == "経営ダッシュボード":
     unit_scale_map = {"円": 1.0, "千円": 1_000.0, "百万円": 1_000_000.0}
     unit_scale = unit_scale_map.get(unit, 1.0)
     unit_suffix = "" if unit == "円" else unit
+    display_unit_label = unit if unit != "円" else "円"
 
     def format_currency(value: Optional[float], *, decimals: Optional[int] = None) -> str:
         if value is None:
@@ -10064,15 +10184,20 @@ elif page == "経営ダッシュボード":
             return "—"
         return f"{value * 100:.1f}%"
 
-    scope_df = apply_store_filter(df_sales)
+    scope_df = apply_filters(df_sales)
     current_df = scope_df[scope_df["month_period"].isin(current_periods)].copy()
     prev_df = scope_df[scope_df["month_period"].isin(prev_periods)].copy()
-    current_all_df = df_sales[df_sales["month_period"].isin(current_periods)].copy()
+    current_all_df = apply_filters(
+        df_sales[df_sales["month_period"].isin(current_periods)], include_store=False
+    )
+    prev_all_df = apply_filters(
+        df_sales[df_sales["month_period"].isin(prev_periods)], include_store=False
+    )
 
     kgi_periods = resolve_periods("直近12ヶ月", latest_period)
     kgi_prev_periods = shift_periods(kgi_periods, 12)
-    kgi_scope = apply_store_filter(period_df(kgi_periods))
-    kgi_prev_scope = apply_store_filter(period_df(kgi_prev_periods))
+    kgi_scope = apply_filters(period_df(kgi_periods))
+    kgi_prev_scope = apply_filters(period_df(kgi_prev_periods))
 
     kgi_sales = float(kgi_scope["売上"].sum()) if not kgi_scope.empty else 0.0
     kgi_prev_sales = (
@@ -10216,234 +10341,325 @@ elif page == "経営ダッシュボード":
             "tab": "資金",
         },
     ]
-    with highlight_area:
+    with dashboard_section("重要KPIハイライト"):
         st.markdown("#### 重要KPIハイライト")
         render_clickable_kpi_cards(primary_cards)
-        st.caption(
-            f"表示条件：{period} ｜ 対象期間：{current_window_label} ｜ 店舗：{store} ｜ 単位：{unit}"
-        )
+        with st.expander("表示条件", icon="🧭"):
+            st.markdown(
+                f"- 期間: **{period}**\n"
+                f"- 集計対象: **{current_window_label}**\n"
+                f"- 店舗: **{store}**\n"
+                f"- 単位: **{unit}**\n"
+                f"- カテゴリ: **{', '.join(selected_categories) if selected_categories else '全て'}**"
+            )
 
-    tab_labels = ["売上", "粗利", "在庫", "資金"]
     tabs = st.tabs(tab_labels)
-
-    query_params = _get_query_params()
-    active_tab = query_params.get("dashboard_tab", [])
-    active_tab = active_tab[-1] if active_tab else tab_labels[0]
-    if active_tab not in tab_labels:
-        active_tab = tab_labels[0]
     st.session_state["executive_active_tab"] = active_tab
 
     with tabs[0]:
-        st.markdown("#### 指標カード")
-        sales_goal = prev_sales * 1.05 if prev_sales else current_sales
-        sales_goal = sales_goal or 0.0
-        goal_rate = (current_sales / sales_goal * 100.0) if sales_goal else None
-        goal_delta = (goal_rate - 100.0) if goal_rate is not None else None
-        yoy_amount = current_sales - prev_sales if prev_sales else None
-        sales_cards = [
-            {
-                "title": "売上総額",
-                "value": format_currency(current_sales),
-                "delta": format_directional_delta(sales_delta_pct),
-                "variant": "is-primary",
-                "caption": f"{period}の売上",
-            },
-            {
-                "title": "目標達成率",
-                "value": f"{goal_rate:.1f}%" if goal_rate is not None else "—",
-                "delta": format_directional_delta(goal_delta, suffix="pt")
-                if goal_delta is not None
-                else None,
-                "variant": "is-accent",
-                "caption": f"目標 {format_currency(sales_goal)}",
-            },
-            {
-                "title": "前期比",
-                "value": format_directional_delta(sales_delta_pct) or "—",
-                "delta": format_currency_signed(yoy_amount),
-                "variant": "is-success",
-                "caption": "金額差分を併記",
-            },
-        ]
-        render_kpi_cards(sales_cards)
+        with dashboard_section("売上KPI", variant="primary"):
+            st.markdown("#### 指標カード")
+            sales_goal = prev_sales * 1.05 if prev_sales else current_sales
+            sales_goal = sales_goal or 0.0
+            goal_rate = (current_sales / sales_goal * 100.0) if sales_goal else None
+            goal_delta = (goal_rate - 100.0) if goal_rate is not None else None
+            yoy_amount = current_sales - prev_sales if prev_sales else None
+            sales_cards = [
+                {
+                    "title": "売上総額",
+                    "value": format_currency(current_sales),
+                    "delta": format_directional_delta(sales_delta_pct),
+                    "variant": "is-primary",
+                    "caption": f"{period}の売上",
+                },
+                {
+                    "title": "目標達成率",
+                    "value": f"{goal_rate:.1f}%" if goal_rate is not None else "—",
+                    "delta": format_directional_delta(goal_delta, suffix="pt")
+                    if goal_delta is not None
+                    else None,
+                    "variant": "is-accent",
+                    "caption": f"目標 {format_currency(sales_goal)}",
+                },
+                {
+                    "title": "前期比",
+                    "value": format_directional_delta(sales_delta_pct) or "—",
+                    "delta": format_currency_signed(yoy_amount),
+                    "variant": "is-success",
+                    "caption": "金額差分を併記",
+                },
+            ]
+            render_kpi_cards(sales_cards)
 
-        st.markdown("#### トレンドと分解")
-        sales_cols = st.columns([1.9, 1.1])
-        with sales_cols[0]:
-            st.markdown("##### 売上トレンド（前年同月比）")
-            trend_scope = df_sales[df_sales["日付"] <= current_end]
-            if store != "全店舗":
-                trend_scope = trend_scope[trend_scope["店舗"] == store]
-            if trend_scope.empty:
-                st.info("トレンドを描画できるデータがありません。")
-            else:
-                trend_monthly = (
-                    trend_scope.groupby("月", as_index=False)["売上"].sum().sort_values("月")
-                )
-                trend_monthly["month_dt"] = pd.to_datetime(
-                    trend_monthly["月"], format="%Y-%m"
-                )
-                trend_monthly = trend_monthly[trend_monthly["month_dt"] <= current_end]
-                trend_monthly = trend_monthly.tail(24)
-                trend_monthly["前年同月売上"] = trend_monthly["売上"].shift(12)
-                fig_trend = go.Figure()
-                fig_trend.add_trace(
-                    go.Scatter(
-                        x=trend_monthly["month_dt"],
-                        y=trend_monthly["売上"],
-                        name="売上",
-                        mode="lines+markers",
-                        line=dict(color=PRIMARY_COLOR, width=3),
-                        hovertemplate="月=%{x|%Y-%m}<br>売上=%{y:,.0f}円<extra></extra>",
+        with dashboard_section("売上トレンドと内訳", variant="primary"):
+            st.markdown("#### トレンドと分解")
+            sales_cols = st.columns([1.9, 1.1])
+            with sales_cols[0]:
+                st.markdown("##### 売上トレンド（前年同月比）")
+                trend_scope = apply_filters(df_sales[df_sales["日付"] <= current_end])
+                if trend_scope.empty:
+                    st.info("トレンドを描画できるデータがありません。")
+                else:
+                    trend_monthly = (
+                        trend_scope.groupby("月", as_index=False)["売上"].sum().sort_values("月")
                     )
-                )
-                if trend_monthly["前年同月売上"].notna().any():
+                    trend_monthly["month_dt"] = pd.to_datetime(
+                        trend_monthly["月"], format="%Y-%m"
+                    )
+                    trend_monthly = trend_monthly[trend_monthly["month_dt"] <= current_end]
+                    trend_monthly = trend_monthly.tail(24)
+                    trend_monthly["前年同月売上"] = trend_monthly["売上"].shift(12)
+                    trend_monthly["前年比"] = np.where(
+                        trend_monthly["前年同月売上"] > 0,
+                        (trend_monthly["売上"] / trend_monthly["前年同月売上"] - 1) * 100,
+                        np.nan,
+                    )
+                    trend_monthly["売上_display"] = trend_monthly["売上"] / unit_scale
+                    trend_monthly["前年_display"] = (
+                        trend_monthly["前年同月売上"] / unit_scale
+                    )
+                    trend_monthly["前年比ラベル"] = trend_monthly["前年比"].apply(
+                        lambda v: f"{v:+.1f}%" if pd.notna(v) else "—"
+                    )
+                    fig_trend = go.Figure()
                     fig_trend.add_trace(
                         go.Scatter(
                             x=trend_monthly["month_dt"],
-                            y=trend_monthly["前年同月売上"],
-                            name="前年同月",
-                            mode="lines",
-                            line=dict(color=ACCENT_COLOR, dash="dot", width=2),
-                            hovertemplate="月=%{x|%Y-%m}<br>前年同月=%{y:,.0f}円<extra></extra>",
+                            y=trend_monthly["売上_display"],
+                            name="売上",
+                            mode="lines+markers",
+                            line=dict(color=PRIMARY_COLOR, width=3),
+                            customdata=np.stack(
+                                [trend_monthly["前年比ラベル"]], axis=-1
+                            ),
+                            hovertemplate=(
+                                "月=%{x|%Y-%m}<br>売上=%{y:,.1f}" + display_unit_label
+                                + "<br>前年比=%{customdata[0]}<extra></extra>"
+                            ),
                         )
                     )
-                fig_trend.update_layout(
-                    height=420,
-                    margin=dict(l=10, r=10, t=40, b=10),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0),
-                )
-                fig_trend.update_xaxes(title="月")
-                fig_trend.update_yaxes(title="金額（円）", tickformat=",.0f")
-                fig_trend = apply_elegant_theme(
-                    fig_trend, theme=st.session_state.get("ui_theme", "light")
-                )
-                render_plotly_with_spinner(
-                    fig_trend, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
-                )
-        with sales_cols[1]:
-            st.markdown("##### 商品カテゴリ別トップ5")
-            if current_df.empty:
-                st.info("選択期間の売上データがありません。")
+                    if trend_monthly["前年同月売上"].notna().any():
+                        fig_trend.add_trace(
+                            go.Scatter(
+                                x=trend_monthly["month_dt"],
+                                y=trend_monthly["前年_display"],
+                                name="前年同月",
+                                mode="lines",
+                                line=dict(color=ACCENT_COLOR, dash="dot", width=2),
+                                hovertemplate=(
+                                    "月=%{x|%Y-%m}<br>前年同月=%{y:,.1f}" + display_unit_label + "<extra></extra>"
+                                ),
+                            )
+                        )
+                    fig_trend.update_layout(
+                        height=420,
+                        margin=dict(l=10, r=10, t=40, b=10),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0),
+                    )
+                    fig_trend.update_xaxes(title="月")
+                    fig_trend.update_yaxes(
+                        title=f"金額（{display_unit_label}）",
+                        tickformat=",.1f",
+                    )
+                    fig_trend = apply_elegant_theme(
+                        fig_trend, theme=st.session_state.get("ui_theme", "light")
+                    )
+                    render_plotly_with_spinner(
+                        fig_trend, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
+                    )
+            with sales_cols[1]:
+                st.markdown("##### 商品カテゴリ別トップ5")
+                if current_df.empty:
+                    st.info("選択期間の売上データがありません。")
+                else:
+                    category_sales = (
+                        current_df.groupby("カテゴリ", as_index=False)["売上"].sum()
+                        .sort_values("売上", ascending=False)
+                        .head(5)
+                        .sort_values("売上")
+                    )
+                    prev_category = (
+                        prev_df.groupby("カテゴリ")["売上"].sum()
+                        if not prev_df.empty
+                        else pd.Series(dtype=float)
+                    )
+                    category_sales["前期売上"] = category_sales["カテゴリ"].map(prev_category).fillna(0.0)
+                    category_sales["差額"] = (
+                        category_sales["売上"] - category_sales["前期売上"]
+                    )
+                    category_sales["前年比"] = np.where(
+                        category_sales["前期売上"] > 0,
+                        (category_sales["売上"] / category_sales["前期売上"] - 1) * 100,
+                        np.nan,
+                    )
+                    category_sales["売上_display"] = category_sales["売上"] / unit_scale
+                    category_sales["差額_display"] = category_sales["差額"] / unit_scale
+                    category_sales["前年比ラベル"] = category_sales["前年比"].apply(
+                        lambda v: f"{v:+.1f}%" if pd.notna(v) else "—"
+                    )
+                    customdata = np.stack(
+                        [
+                            category_sales["前年比ラベル"],
+                            category_sales["差額_display"],
+                        ],
+                        axis=-1,
+                    )
+                    fig_category = px.bar(
+                        category_sales,
+                        x="売上_display",
+                        y="カテゴリ",
+                        orientation="h",
+                        color="カテゴリ",
+                        color_discrete_sequence=px.colors.qualitative.Set2,
+                    )
+                    fig_category.update_traces(
+                        customdata=customdata,
+                        hovertemplate=(
+                            "カテゴリ=%{y}<br>売上=%{x:,.1f}" + display_unit_label
+                            + "<br>前年比=%{customdata[0]}<br>差額=%{customdata[1]:,.1f}" + display_unit_label
+                            + "<extra></extra>"
+                        ),
+                    )
+                    fig_category.update_layout(
+                        height=260,
+                        margin=dict(l=10, r=10, t=30, b=10),
+                        xaxis_title=f"金額（{display_unit_label}）",
+                        yaxis_title="カテゴリ",
+                        showlegend=False,
+                    )
+                    fig_category = apply_elegant_theme(
+                        fig_category, theme=st.session_state.get("ui_theme", "light")
+                    )
+                    render_plotly_with_spinner(
+                        fig_category, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
+                    )
+
+                st.markdown("##### チャネル別売上")
+                if current_all_df.empty:
+                    st.info("チャネル別の売上データがありません。")
+                else:
+                    channel_sales = (
+                        current_all_df.groupby("チャネル", as_index=False)["売上"].sum()
+                        .sort_values("売上", ascending=True)
+                    )
+                    prev_channel = (
+                        prev_all_df.groupby("チャネル")["売上"].sum()
+                        if not prev_all_df.empty
+                        else pd.Series(dtype=float)
+                    )
+                    channel_sales["前期売上"] = channel_sales["チャネル"].map(prev_channel).fillna(0.0)
+                    channel_sales["差額"] = (
+                        channel_sales["売上"] - channel_sales["前期売上"]
+                    )
+                    channel_sales["前年比"] = np.where(
+                        channel_sales["前期売上"] > 0,
+                        (channel_sales["売上"] / channel_sales["前期売上"] - 1) * 100,
+                        np.nan,
+                    )
+                    channel_sales["売上_display"] = channel_sales["売上"] / unit_scale
+                    channel_sales["差額_display"] = channel_sales["差額"] / unit_scale
+                    channel_sales["前年比ラベル"] = channel_sales["前年比"].apply(
+                        lambda v: f"{v:+.1f}%" if pd.notna(v) else "—"
+                    )
+                    fig_channel = px.bar(
+                        channel_sales,
+                        y="チャネル",
+                        x="売上_display",
+                        orientation="h",
+                        color="売上_display",
+                        color_continuous_scale=px.colors.sequential.Blues,
+                    )
+                    fig_channel.update_traces(
+                        customdata=np.stack(
+                            [channel_sales["前年比ラベル"], channel_sales["差額_display"]],
+                            axis=-1,
+                        ),
+                        hovertemplate=(
+                            "チャネル=%{y}<br>売上=%{x:,.1f}" + display_unit_label
+                            + "<br>前年比=%{customdata[0]}<br>差額=%{customdata[1]:,.1f}" + display_unit_label
+                            + "<extra></extra>"
+                        ),
+                    )
+                    fig_channel.update_layout(
+                        height=260,
+                        margin=dict(l=10, r=10, t=30, b=10),
+                        xaxis_title=f"金額（{display_unit_label}）",
+                        yaxis_title="チャネル",
+                        coloraxis_colorbar=dict(title=f"{display_unit_label}"),
+                    )
+                    fig_channel = apply_elegant_theme(
+                        fig_channel, theme=st.session_state.get("ui_theme", "light")
+                    )
+                    render_plotly_with_spinner(
+                        fig_channel, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
+                    )
+
+        with dashboard_section("売上詳細リスト", variant="secondary"):
+            st.markdown("#### 明細テーブル")
+            detail_df = current_df.copy()
+            if detail_df.empty:
+                st.info("明細を表示するデータがありません。")
             else:
-                category_sales = (
-                    current_df.groupby("カテゴリ", as_index=False)["売上"].sum()
-                    .sort_values("売上", ascending=False)
-                    .head(5)
-                    .sort_values("売上")
-                )
-                fig_category = px.bar(
-                    category_sales,
-                    x="売上",
-                    y="カテゴリ",
-                    orientation="h",
-                    color_discrete_sequence=[ACCENT_COLOR],
-                )
-                fig_category.update_layout(
-                    height=260,
-                    margin=dict(l=10, r=10, t=30, b=10),
-                    xaxis_title="金額（円）",
-                    yaxis_title="カテゴリ",
-                )
-                fig_category = apply_elegant_theme(
-                    fig_category, theme=st.session_state.get("ui_theme", "light")
-                )
-                render_plotly_with_spinner(
-                    fig_category, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
-                )
+                with st.expander("明細を表示", icon="📋", expanded=False):
+                    detail_df["日付"] = detail_df["日付"].dt.strftime("%Y-%m-%d")
+                    detail_df = detail_df.sort_values("日付", ascending=False)
+                    display_cols = [
+                        "日付",
+                        "店舗",
+                        "商品",
+                        "カテゴリ",
+                        "売上",
+                        "数量",
+                        "粗利",
+                        "粗利率",
+                    ]
+                    st.dataframe(
+                        detail_df[display_cols],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "売上": st.column_config.NumberColumn("売上", format="¥%,d"),
+                            "粗利": st.column_config.NumberColumn("粗利", format="¥%,d"),
+                            "数量": st.column_config.NumberColumn("数量", format="%,d"),
+                            "粗利率": st.column_config.NumberColumn("粗利率", format="%.1f%%"),
+                        },
+                    )
 
-            st.markdown("##### チャネル別売上")
-            if current_all_df.empty:
-                st.info("チャネル別の売上データがありません。")
-            else:
-                channel_sales = (
-                    current_all_df.groupby("チャネル", as_index=False)["売上"].sum()
-                    .sort_values("売上", ascending=True)
+                csv_bytes = (
+                    detail_df[display_cols].to_csv(index=False).encode("utf-8-sig")
                 )
-                fig_channel = px.bar(
-                    channel_sales,
-                    y="チャネル",
-                    x="売上",
-                    orientation="h",
-                    color_discrete_sequence=[PRIMARY_COLOR],
+                pdf_table_df = (
+                    detail_df.groupby("商品", as_index=False)["売上"].sum()
+                    .rename(columns={"商品": "product_name", "売上": "year_sum"})
+                    .assign(product_code=lambda df: df["product_name"])
                 )
-                fig_channel.update_layout(
-                    height=260,
-                    margin=dict(l=10, r=10, t=30, b=10),
-                    xaxis_title="金額（円）",
-                    yaxis_title="チャネル",
+                pdf_kpi = {
+                    "売上総額": f"¥{current_sales:,.0f}",
+                    "目標達成率": f"{goal_rate:.1f}%" if goal_rate is not None else "—",
+                    "前期比": format_directional_delta(sales_delta_pct) or "—",
+                }
+                pdf_filename = f"sales_detail_{anchor_month or 'latest'}.pdf"
+                pdf_bytes = (
+                    download_pdf_overview(pdf_kpi, pdf_table_df, pdf_filename)
+                    if not pdf_table_df.empty
+                    else b""
                 )
-                fig_channel = apply_elegant_theme(
-                    fig_channel, theme=st.session_state.get("ui_theme", "light")
-                )
-                render_plotly_with_spinner(
-                    fig_channel, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
-                )
-
-        st.markdown("#### 明細テーブル")
-        detail_df = current_df.copy()
-        if detail_df.empty:
-            st.info("明細を表示するデータがありません。")
-        else:
-            detail_df["日付"] = detail_df["日付"].dt.strftime("%Y-%m-%d")
-            detail_df = detail_df.sort_values("日付", ascending=False)
-            display_cols = [
-                "日付",
-                "店舗",
-                "商品",
-                "カテゴリ",
-                "売上",
-                "数量",
-                "粗利",
-                "粗利率",
-            ]
-            st.dataframe(
-                detail_df[display_cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "売上": st.column_config.NumberColumn("売上", format="¥%,d"),
-                    "粗利": st.column_config.NumberColumn("粗利", format="¥%,d"),
-                    "数量": st.column_config.NumberColumn("数量", format="%,d"),
-                    "粗利率": st.column_config.NumberColumn("粗利率", format="%.1f%%"),
-                },
-            )
-
-            csv_bytes = (
-                detail_df[display_cols].to_csv(index=False).encode("utf-8-sig")
-            )
-            pdf_table_df = (
-                detail_df.groupby("商品", as_index=False)["売上"].sum()
-                .rename(columns={"商品": "product_name", "売上": "year_sum"})
-                .assign(product_code=lambda df: df["product_name"])
-            )
-            pdf_kpi = {
-                "売上総額": f"¥{current_sales:,.0f}",
-                "目標達成率": f"{goal_rate:.1f}%" if goal_rate is not None else "—",
-                "前期比": format_directional_delta(sales_delta_pct) or "—",
-            }
-            pdf_filename = f"sales_detail_{anchor_month or 'latest'}.pdf"
-            pdf_bytes = (
-                download_pdf_overview(pdf_kpi, pdf_table_df, pdf_filename)
-                if not pdf_table_df.empty
-                else b""
-            )
-            download_cols = st.columns(2)
-            with download_cols[0]:
-                st.download_button(
-                    "CSVダウンロード",
-                    data=csv_bytes,
-                    file_name=f"sales_detail_{anchor_month}.csv",
-                    mime="text/csv",
-                )
-            with download_cols[1]:
-                st.download_button(
-                    "PDFダウンロード",
-                    data=pdf_bytes if pdf_bytes else b"",
-                    file_name=pdf_filename,
-                    mime="application/pdf",
-                    disabled=not pdf_bytes,
-                )
+                download_cols = st.columns(2)
+                with download_cols[0]:
+                    st.download_button(
+                        "CSVダウンロード",
+                        data=csv_bytes,
+                        file_name=f"sales_detail_{anchor_month}.csv",
+                        mime="text/csv",
+                    )
+                with download_cols[1]:
+                    st.download_button(
+                        "PDFダウンロード",
+                        data=pdf_bytes if pdf_bytes else b"",
+                        file_name=pdf_filename,
+                        mime="application/pdf",
+                        disabled=not pdf_bytes,
+                    )
     with tabs[1]:
         st.markdown("#### 指標カード")
         gross_goal = prev_gross * 1.05 if prev_gross else current_gross
