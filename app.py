@@ -10026,29 +10026,70 @@ elif page == "経営ダッシュボード":
         icon=":bar_chart:",
     )
 
-    data_path = Path("data/sales.csv")
-    if not data_path.exists():
-        st.error("売上データ (data/sales.csv) が見つかりません。")
-        st.stop()
+    monthly_df = st.session_state.get("data_monthly")
+    if monthly_df is not None and not getattr(monthly_df, "empty", True):
+        df_sales = monthly_df.copy()
+        if not {"month", "sales_amount_jpy"}.issubset(df_sales.columns):
+            st.error("取込データに月度と売上列が必要です。テンプレートを確認してください。")
+            st.stop()
 
-    df_sales = pd.read_csv(data_path)
-    if df_sales.empty:
-        st.warning("売上データが空です。サンプルデータを配置してください。")
-        st.stop()
+        df_sales["日付"] = pd.to_datetime(
+            df_sales["month"].astype(str) + "-01", errors="coerce"
+        ) + pd.offsets.MonthEnd(0)
+        df_sales = df_sales.dropna(subset=["日付"]).copy()
+        df_sales["売上"] = (
+            pd.to_numeric(df_sales.get("sales_amount_jpy"), errors="coerce").fillna(0.0)
+        )
+        df_sales["数量"] = (
+            pd.to_numeric(df_sales.get("quantity"), errors="coerce")
+            .fillna(0)
+            .round()
+            .astype("Int64")
+        )
+        gross_margin_rate = pd.to_numeric(
+            df_sales.get("gross_margin_rate"), errors="coerce"
+        )
+        df_sales["粗利率"] = gross_margin_rate.fillna(0.0) if gross_margin_rate is not None else 0.0
+        df_sales["粗利"] = df_sales["売上"] * df_sales["粗利率"]
+        df_sales["店舗"] = df_sales.get("store", "全体")
+        df_sales["店舗"] = df_sales["店舗"].fillna("全体")
+        df_sales["商品"] = df_sales.get("product_name", df_sales.get("product_code", "未設定"))
+        df_sales["商品"] = df_sales["商品"].fillna("未設定")
+        if "カテゴリ" in df_sales.columns:
+            df_sales["カテゴリ"] = df_sales["カテゴリ"].fillna("その他")
+        else:
+            df_sales["カテゴリ"] = (
+                df_sales["商品"].map(CATEGORY_LOOKUP).fillna(
+                    df_sales["商品"].apply(_derive_category_label)
+                )
+            )
+        if "チャネル" not in df_sales.columns:
+            df_sales["チャネル"] = df_sales["店舗"].astype(str)
+    else:
+        data_path = Path("data/sales.csv")
+        if not data_path.exists():
+            st.error("売上データ (data/sales.csv) が見つかりません。")
+            st.stop()
 
-    df_sales["日付"] = pd.to_datetime(df_sales["日付"], errors="coerce")
-    df_sales = df_sales.dropna(subset=["日付"]).copy()
-    df_sales["売上"] = pd.to_numeric(df_sales.get("売上"), errors="coerce").fillna(0.0)
-    df_sales["数量"] = (
-        pd.to_numeric(df_sales.get("数量"), errors="coerce").fillna(0).round().astype("Int64")
-    )
-    df_sales["粗利率"] = pd.to_numeric(df_sales.get("粗利率"), errors="coerce").fillna(0.0)
-    df_sales["粗利"] = df_sales["売上"] * df_sales["粗利率"]
-    df_sales["店舗"] = df_sales["店舗"].fillna("未設定")
-    df_sales["商品"] = df_sales["商品"].fillna("未設定")
-    df_sales["カテゴリ"] = df_sales["商品"].map(CATEGORY_LOOKUP).fillna("その他")
-    if "チャネル" not in df_sales.columns:
-        df_sales["チャネル"] = df_sales["店舗"].astype(str)
+        df_sales = pd.read_csv(data_path)
+        if df_sales.empty:
+            st.warning("売上データが空です。サンプルデータを配置してください。")
+            st.stop()
+
+        df_sales["日付"] = pd.to_datetime(df_sales["日付"], errors="coerce")
+        df_sales = df_sales.dropna(subset=["日付"]).copy()
+        df_sales["売上"] = pd.to_numeric(df_sales.get("売上"), errors="coerce").fillna(0.0)
+        df_sales["数量"] = (
+            pd.to_numeric(df_sales.get("数量"), errors="coerce").fillna(0).round().astype("Int64")
+        )
+        df_sales["粗利率"] = pd.to_numeric(df_sales.get("粗利率"), errors="coerce").fillna(0.0)
+        df_sales["粗利"] = df_sales["売上"] * df_sales["粗利率"]
+        df_sales["店舗"] = df_sales["店舗"].fillna("未設定")
+        df_sales["商品"] = df_sales["商品"].fillna("未設定")
+        df_sales["カテゴリ"] = df_sales["商品"].map(CATEGORY_LOOKUP).fillna("その他")
+        if "チャネル" not in df_sales.columns:
+            df_sales["チャネル"] = df_sales["店舗"].astype(str)
+
     df_sales["月"] = df_sales["日付"].dt.to_period("M").astype(str)
     df_sales["month_period"] = df_sales["日付"].dt.to_period("M")
     latest_period = df_sales["month_period"].max()
