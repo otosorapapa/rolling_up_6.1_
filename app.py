@@ -10591,66 +10591,6 @@ elif page == "経営ダッシュボード":
                         fig_category, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
                     )
 
-                st.markdown("##### チャネル別売上")
-                if current_all_df.empty:
-                    st.info("チャネル別の売上データがありません。")
-                else:
-                    channel_sales = (
-                        current_all_df.groupby("チャネル", as_index=False)["売上"].sum()
-                        .sort_values("売上", ascending=True)
-                    )
-                    prev_channel = (
-                        prev_all_df.groupby("チャネル")["売上"].sum()
-                        if not prev_all_df.empty
-                        else pd.Series(dtype=float)
-                    )
-                    channel_sales["前期売上"] = channel_sales["チャネル"].map(prev_channel).fillna(0.0)
-                    channel_sales["差額"] = (
-                        channel_sales["売上"] - channel_sales["前期売上"]
-                    )
-                    channel_sales["前年比"] = np.where(
-                        channel_sales["前期売上"] > 0,
-                        (channel_sales["売上"] / channel_sales["前期売上"] - 1) * 100,
-                        np.nan,
-                    )
-                    channel_sales["売上_display"] = channel_sales["売上"] / unit_scale
-                    channel_sales["差額_display"] = channel_sales["差額"] / unit_scale
-                    channel_sales["前年比ラベル"] = channel_sales["前年比"].apply(
-                        lambda v: f"{v:+.1f}%" if pd.notna(v) else "—"
-                    )
-                    fig_channel = px.bar(
-                        channel_sales,
-                        y="チャネル",
-                        x="売上_display",
-                        orientation="h",
-                        color="売上_display",
-                        color_continuous_scale=px.colors.sequential.Blues,
-                    )
-                    fig_channel.update_traces(
-                        customdata=np.stack(
-                            [channel_sales["前年比ラベル"], channel_sales["差額_display"]],
-                            axis=-1,
-                        ),
-                        hovertemplate=(
-                            "チャネル=%{y}<br>売上=%{x:,.1f}" + display_unit_label
-                            + "<br>前年比=%{customdata[0]}<br>差額=%{customdata[1]:,.1f}" + display_unit_label
-                            + "<extra></extra>"
-                        ),
-                    )
-                    fig_channel.update_layout(
-                        height=260,
-                        margin=dict(l=10, r=10, t=30, b=10),
-                        xaxis_title=f"金額（{display_unit_label}）",
-                        yaxis_title="チャネル",
-                        coloraxis_colorbar=dict(title=f"{display_unit_label}"),
-                    )
-                    fig_channel = apply_elegant_theme(
-                        fig_channel, theme=st.session_state.get("ui_theme", "light")
-                    )
-                    render_plotly_with_spinner(
-                        fig_channel, config=PLOTLY_CONFIG, spinner_text=SPINNER_MESSAGE
-                    )
-
         with dashboard_section("売上詳細リスト", variant="secondary"):
             st.markdown("#### 明細テーブル")
             detail_df = current_df.copy()
