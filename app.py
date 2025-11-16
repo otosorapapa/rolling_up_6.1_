@@ -10251,7 +10251,7 @@ elif page == "経営ダッシュボード":
         df_sales[df_sales["month_period"].isin(prev_periods)], include_store=False
     )
 
-    kgi_periods = resolve_periods("直近12ヶ月", latest_period)
+    kgi_periods = current_periods
     kgi_prev_periods = shift_periods(kgi_periods, 12)
     kgi_scope = apply_filters(period_df(kgi_periods))
     kgi_prev_scope = apply_filters(period_df(kgi_prev_periods))
@@ -10283,20 +10283,10 @@ elif page == "経営ダッシュボード":
 
     baseline_cash = 1_000_000.0
     cash_multiplier = 0.25
-    kgi_end = kgi_periods.max().to_timestamp(how="end") if len(kgi_periods) else anchor_period.to_timestamp(how="end")
-    kgi_prev_end = (
-        kgi_prev_periods.max().to_timestamp(how="end") if len(kgi_prev_periods) else None
-    )
-    cumulative_kgi = float(scope_df[scope_df["日付"] <= kgi_end]["粗利"].sum())
-    cumulative_kgi_prev = (
-        float(scope_df[scope_df["日付"] <= kgi_prev_end]["粗利"].sum())
-        if kgi_prev_end is not None
-        else None
-    )
-    kgi_cash_current = baseline_cash + cumulative_kgi * cash_multiplier
+    kgi_cash_current = baseline_cash + kgi_gross * cash_multiplier
     kgi_cash_prev = (
-        baseline_cash + cumulative_kgi_prev * cash_multiplier
-        if cumulative_kgi_prev is not None
+        baseline_cash + kgi_prev_gross * cash_multiplier
+        if kgi_prev_scope is not None and not kgi_prev_scope.empty
         else None
     )
     kgi_cash_delta_pct = (
